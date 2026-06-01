@@ -17,6 +17,18 @@
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { config, AUTHORIZED_PLANS, OWNER_EMAILS } from "./config.js";
+import { loadTokens, saveTokens, type Tokens } from "./tokenStore.js";
+
+/**
+ * Live tokens. Seeded from env on first boot, then sourced from the cache file
+ * (rewritten on every refresh). Held mutable so an in-process refresh is used by
+ * later requests with NO restart. A freshly spawned process reads the cache here,
+ * so a token refreshed in a prior run is picked up without re-running connect.
+ */
+let tokens: Tokens = loadTokens({
+  accessToken: config.accessToken,
+  refreshToken: config.refreshToken,
+});
 
 export interface Session {
   userId: string;
@@ -30,19 +42,27 @@ export interface Session {
 export class AuthError extends Error {}
 
 let client: SupabaseClient | null = null;
+let authClient: SupabaseClient | null = null;
 let sessionPromise: Promise<Session> | null = null;
 
-function getClient(): SupabaseClient {
+function assertSupabaseConfig(): void {
   if (!config.supabaseUrl || !config.supabaseAnonKey) {
     throw new AuthError(
       "Missing MAHINATAR_SUPABASE_URL or MAHINATAR_SUPABASE_ANON_KEY. Set them in your MCP env config."
     );
   }
+}
+
+/**
+ * Data client — carries the user JWT as a Bearer header so PostgREST runs every
+ * request under that user's RLS. Rebuilt whenever the access token changes (set
+ * `client = null`), so a refreshed token takes effect for subsequent queries.
+ */
+function getClient(): SupabaseClient {
+  assertSupabaseConfig();
   if (!client) {
-    // When a token is present, attach it as a Bearer header so PostgREST runs
-    // every request as that user (RLS) even before/without setSession resolving.
-    const headers = config.accessToken
-      ? { Authorization: `Bearer ${config.accessToken}` }
+    const headers = tokens.accessToken
+      ? { Authorization: `Bearer ${tokens.accessToken}` }
       : undefined;
     client = createClient(config.supabaseUrl, config.supabaseAnonKey, {
       auth: { persistSession: false, autoRefreshToken: false },
@@ -50,6 +70,60 @@ function getClient(): SupabaseClient {
     });
   }
   return client;
+}
+
+/** Anon client with no user-token override — used only for auth (refresh/getUser). */
+function getAuthClient(): SupabaseClient {
+  assertSupabaseConfig();
+  if (!authClient) {
+    authClient = createClient(config.supabaseUrl, config.supabaseAnonKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+  }
+  return authClient;
+}
+
+/** True if the JWT is expired or within `skewSec` of expiring (or unparseable). */
+function isExpiringSoon(jwt: string, skewSec = 60): boolean {
+  try {
+    const payload = JSON.parse(
+      Buffer.from(jwt.split(".")[1], "base64url").toString("utf8")
+    );
+    if (typeof payload.exp !== "number") return true;
+    return Date.now() / 1000 >= payload.exp - skewSec;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Exchange the refresh token for a fresh access+refresh pair, persist it, and
+ * invalidate the data client so the new bearer is used. Returns false (no throw)
+ * if refresh fails — the caller surfaces a clean auth error.
+ */
+async function refreshTokens(): Promise<boolean> {
+  if (!tokens.refreshToken) return false;
+  const { data, error } = await getAuthClient().auth.refreshSession({
+    refresh_token: tokens.refreshToken,
+  });
+  if (error || !data.session) {
+    console.error("mahinatar-mcp: token refresh failed:", error?.message ?? "no session");
+    return false;
+  }
+  tokens = {
+    accessToken: data.session.access_token,
+    refreshToken: data.session.refresh_token, // refresh tokens rotate — persist the new one
+  };
+  saveTokens(tokens);
+  client = null; // force rebuild with the new bearer
+  return true;
+}
+
+/** Refresh proactively if the access token is expired or near-expiry. */
+async function ensureFreshToken(): Promise<void> {
+  if (!tokens.accessToken) return; // password-auth mode
+  if (!isExpiringSoon(tokens.accessToken)) return;
+  await refreshTokens(); // best-effort; sign-in below reports a hard failure
 }
 
 /** Reads the plan for a user id from the subscriptions table (RLS-scoped). */
@@ -97,27 +171,26 @@ function finalize(
 }
 
 async function doTokenSignIn(): Promise<Session> {
-  const supabase = getClient();
+  // Refresh up front if the token is stale (covers boot with an expired token).
+  await ensureFreshToken();
 
-  // Establish a session object so getUser()/auth refresh work. The Bearer
-  // header set in getClient() already scopes PostgREST to this user.
-  const { error: setErr } = await supabase.auth.setSession({
-    access_token: config.accessToken,
-    refresh_token: config.refreshToken || config.accessToken,
-  });
-  // setSession can fail to refresh if no refresh token; that's fine — getUser
-  // with the access token below is the source of truth.
+  let { data, error } = await getAuthClient().auth.getUser(tokens.accessToken);
 
-  const { data, error } = await supabase.auth.getUser(config.accessToken);
+  // If still rejected (e.g. token expired between the check and the call, or no
+  // skew margin), try one refresh + retry before giving up.
+  if ((error || !data.user) && (await refreshTokens())) {
+    ({ data, error } = await getAuthClient().auth.getUser(tokens.accessToken));
+  }
+
   if (error || !data.user) {
     throw new AuthError(
-      `Could not authenticate with MAHINATAR_ACCESS_TOKEN: ${error?.message ?? setErr?.message ?? "invalid or expired token"}. Get a fresh access token from your Mahinatar session (see README → Token connect).`
+      `Could not authenticate with the Mahinatar token: ${error?.message ?? "invalid or expired token"}. The refresh token may have been revoked — reconnect from the Mahinatar MCP page.`
     );
   }
 
   const userId = data.user.id;
   const email = data.user.email ?? config.email ?? "";
-  const { planId, planStatus } = await resolvePlan(supabase, userId);
+  const { planId, planStatus } = await resolvePlan(getClient(), userId);
   return finalize(userId, email, planId, planStatus, "token");
 }
 
@@ -149,7 +222,7 @@ async function doPasswordSignIn(): Promise<Session> {
 
 async function doSignIn(): Promise<Session> {
   // Prefer token auth when present (Google-login users have no password).
-  if (config.accessToken) return doTokenSignIn();
+  if (tokens.accessToken) return doTokenSignIn();
   return doPasswordSignIn();
 }
 
@@ -168,6 +241,9 @@ export async function getSession(): Promise<Session> {
 /** Returns the authenticated Supabase client (after ensuring a session). */
 export async function getAuthedClient(): Promise<{ supabase: SupabaseClient; session: Session }> {
   const session = await getSession();
+  // Keep the token fresh across long-running sessions (token TTL ~1h). If it
+  // refreshed, getClient() rebuilds with the new bearer.
+  await ensureFreshToken();
   return { supabase: getClient(), session };
 }
 
