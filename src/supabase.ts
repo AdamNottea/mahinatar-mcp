@@ -1,8 +1,12 @@
 /**
  * Supabase client + auth + Elite plan gate.
  *
- * Auth model: we sign in with the user's OWN email/password using the public
- * anon key. Every query therefore runs under that user's Supabase RLS policies.
+ * Auth model — two paths, both run under the USER'S OWN Supabase RLS:
+ *   1. TOKEN (preferred for Google-login users with no password): set
+ *      MAHINATAR_ACCESS_TOKEN (a Supabase user JWT) and optionally
+ *      MAHINATAR_REFRESH_TOKEN. We attach the token as a Bearer header on every
+ *      request AND call auth.setSession() so getUser() resolves the user.
+ *   2. EMAIL/PASSWORD (fallback): signInWithPassword with the anon key.
  * We NEVER use a service-role key — the server cannot escalate past the user's
  * own data, by design.
  *
@@ -20,6 +24,7 @@ export interface Session {
   planId: string | null;
   planStatus: string | null;
   authorized: boolean;
+  authMethod: "token" | "password";
 }
 
 export class AuthError extends Error {}
@@ -34,37 +39,24 @@ function getClient(): SupabaseClient {
     );
   }
   if (!client) {
+    // When a token is present, attach it as a Bearer header so PostgREST runs
+    // every request as that user (RLS) even before/without setSession resolving.
+    const headers = config.accessToken
+      ? { Authorization: `Bearer ${config.accessToken}` }
+      : undefined;
     client = createClient(config.supabaseUrl, config.supabaseAnonKey, {
       auth: { persistSession: false, autoRefreshToken: false },
+      ...(headers ? { global: { headers } } : {}),
     });
   }
   return client;
 }
 
-async function doSignIn(): Promise<Session> {
-  const supabase = getClient();
-
-  if (!config.email || !config.password) {
-    throw new AuthError(
-      "Missing MAHINATAR_EMAIL or MAHINATAR_PASSWORD. Set them in your MCP env config so the server can sign in to your Mahinatar account."
-    );
-  }
-
-  const { data, error } = await supabase.auth.signInWithPassword({
-    email: config.email,
-    password: config.password,
-  });
-
-  if (error || !data.user) {
-    throw new AuthError(
-      `Could not sign in to Mahinatar as ${config.email}: ${error?.message ?? "unknown error"}. Check MAHINATAR_EMAIL / MAHINATAR_PASSWORD.`
-    );
-  }
-
-  const userId = data.user.id;
-  const email = data.user.email ?? config.email;
-
-  // Read the plan from the subscriptions table (RLS scopes to this user).
+/** Reads the plan for a user id from the subscriptions table (RLS-scoped). */
+async function resolvePlan(
+  supabase: SupabaseClient,
+  userId: string
+): Promise<{ planId: string | null; planStatus: string | null }> {
   let planId: string | null = null;
   let planStatus: string | null = null;
   try {
@@ -82,17 +74,83 @@ async function doSignIn(): Promise<Session> {
     // No subscriptions row / table access — treated as unauthorized below
     // unless the email is an owner.
   }
+  return { planId, planStatus };
+}
 
+function finalize(
+  userId: string,
+  email: string,
+  planId: string | null,
+  planStatus: string | null,
+  authMethod: "token" | "password"
+): Session {
   const planAuthorized = planId != null && AUTHORIZED_PLANS.has(planId.toLowerCase());
   const ownerAuthorized = OWNER_EMAILS.has(email.toLowerCase());
-
   return {
     userId,
     email,
     planId,
     planStatus,
     authorized: planAuthorized || ownerAuthorized,
+    authMethod,
   };
+}
+
+async function doTokenSignIn(): Promise<Session> {
+  const supabase = getClient();
+
+  // Establish a session object so getUser()/auth refresh work. The Bearer
+  // header set in getClient() already scopes PostgREST to this user.
+  const { error: setErr } = await supabase.auth.setSession({
+    access_token: config.accessToken,
+    refresh_token: config.refreshToken || config.accessToken,
+  });
+  // setSession can fail to refresh if no refresh token; that's fine — getUser
+  // with the access token below is the source of truth.
+
+  const { data, error } = await supabase.auth.getUser(config.accessToken);
+  if (error || !data.user) {
+    throw new AuthError(
+      `Could not authenticate with MAHINATAR_ACCESS_TOKEN: ${error?.message ?? setErr?.message ?? "invalid or expired token"}. Get a fresh access token from your Mahinatar session (see README → Token connect).`
+    );
+  }
+
+  const userId = data.user.id;
+  const email = data.user.email ?? config.email ?? "";
+  const { planId, planStatus } = await resolvePlan(supabase, userId);
+  return finalize(userId, email, planId, planStatus, "token");
+}
+
+async function doPasswordSignIn(): Promise<Session> {
+  const supabase = getClient();
+
+  if (!config.email || !config.password) {
+    throw new AuthError(
+      "No auth configured. Set MAHINATAR_ACCESS_TOKEN (recommended for Google-login users) OR MAHINATAR_EMAIL + MAHINATAR_PASSWORD in your MCP env config."
+    );
+  }
+
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email: config.email,
+    password: config.password,
+  });
+
+  if (error || !data.user) {
+    throw new AuthError(
+      `Could not sign in to Mahinatar as ${config.email}: ${error?.message ?? "unknown error"}. Check MAHINATAR_EMAIL / MAHINATAR_PASSWORD.`
+    );
+  }
+
+  const userId = data.user.id;
+  const email = data.user.email ?? config.email;
+  const { planId, planStatus } = await resolvePlan(supabase, userId);
+  return finalize(userId, email, planId, planStatus, "password");
+}
+
+async function doSignIn(): Promise<Session> {
+  // Prefer token auth when present (Google-login users have no password).
+  if (config.accessToken) return doTokenSignIn();
+  return doPasswordSignIn();
 }
 
 /** Returns the signed-in session, signing in once and caching the result. */

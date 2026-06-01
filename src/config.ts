@@ -7,6 +7,10 @@ export interface Config {
   supabaseAnonKey: string;
   email: string;
   password: string;
+  /** Supabase user JWT (access token). Preferred auth for Google-login users. */
+  accessToken: string;
+  /** Optional refresh token paired with the access token. */
+  refreshToken: string;
   resendApiKey: string | undefined;
   /** Master safety switch: only the literal "true" enables live send. */
   outreachLive: boolean;
@@ -22,6 +26,8 @@ export const config: Config = {
   supabaseAnonKey: req("MAHINATAR_SUPABASE_ANON_KEY"),
   email: req("MAHINATAR_EMAIL"),
   password: req("MAHINATAR_PASSWORD"),
+  accessToken: req("MAHINATAR_ACCESS_TOKEN"),
+  refreshToken: req("MAHINATAR_REFRESH_TOKEN"),
   resendApiKey: req("RESEND_API_KEY") || undefined,
   outreachLive: req("MAHINATAR_OUTREACH_LIVE").toLowerCase() === "true",
   fromEmail: req("MAHINATAR_FROM_EMAIL") || undefined,

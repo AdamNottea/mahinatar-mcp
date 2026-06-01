@@ -26,6 +26,12 @@ export const LEAD_LIST_COLUMNS = [
   "outreach_status",
   "notes",
   "created_at",
+  "updated_at",
+  "sale_amount",
+  "temperature",
+  "priority",
+  "has_generated_site",
+  "follow_up_date",
 ] as const;
 
 export interface Lead {
@@ -45,6 +51,12 @@ export interface Lead {
   outreach_status: string | null;
   notes: string | null;
   created_at: string | null;
+  updated_at?: string | null;
+  sale_amount?: number | null;
+  temperature?: string | null;
+  priority?: string | null;
+  has_generated_site?: boolean | null;
+  follow_up_date?: string | null;
   // Possible compliance columns, present only on some rows/schemas.
   do_not_contact?: boolean | null;
   unsubscribed?: boolean | null;
@@ -52,6 +64,38 @@ export interface Lead {
 }
 
 const SELECT = LEAD_LIST_COLUMNS.join(", ");
+
+/**
+ * Probe which of `candidates` actually exist on a table by selecting them in
+ * one cheap (limit 0) query and falling back column-by-column on error. Result
+ * is cached per table for the process lifetime.
+ */
+const columnCache = new Map<string, Set<string>>();
+
+export async function existingColumns(
+  supabase: SupabaseClient,
+  table: string,
+  candidates: readonly string[]
+): Promise<Set<string>> {
+  const cacheKey = `${table}:${candidates.join(",")}`;
+  const cached = columnCache.get(cacheKey);
+  if (cached) return cached;
+
+  const present = new Set<string>();
+  // Fast path: try all at once.
+  const { error } = await supabase.from(table).select(candidates.join(", ")).limit(0);
+  if (!error) {
+    for (const c of candidates) present.add(c);
+  } else {
+    // Slow path: probe individually.
+    for (const c of candidates) {
+      const { error: e } = await supabase.from(table).select(c).limit(0);
+      if (!e) present.add(c);
+    }
+  }
+  columnCache.set(cacheKey, present);
+  return present;
+}
 
 export async function fetchLead(
   supabase: SupabaseClient,
@@ -132,4 +176,161 @@ export async function markLeadContacted(
     }
   }
   throw new Error(lastErr ?? "Failed to update lead.");
+}
+
+/** Appends a timestamped line to an existing notes string. */
+function appendNote(existing: string | null | undefined, note: string): string {
+  const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
+  const line = `[${stamp}] ${note.trim()}`;
+  return existing && existing.trim() ? `${existing.trim()}\n${line}` : line;
+}
+
+/**
+ * Generalized lead update. Only touches columns that exist (defensive). Can set
+ * status and/or stage (outreach_status) and/or append a timestamped note.
+ * Returns which fields were applied.
+ */
+export async function updateLead(
+  supabase: SupabaseClient,
+  id: string,
+  opts: { status?: string; stage?: string; note?: string }
+): Promise<{ applied: string[] }> {
+  const cols = await existingColumns(supabase, "leads", [
+    "status",
+    "outreach_status",
+    "notes",
+    "updated_at",
+  ]);
+
+  const patch: Record<string, unknown> = {};
+  const applied: string[] = [];
+
+  if (opts.status && cols.has("status")) {
+    patch.status = opts.status;
+    applied.push("status");
+  }
+  if (opts.stage && cols.has("outreach_status")) {
+    patch.outreach_status = opts.stage;
+    applied.push("stage");
+  }
+  if (opts.note && cols.has("notes")) {
+    // Read current notes so we append rather than overwrite.
+    const current = await fetchLead(supabase, id);
+    patch.notes = appendNote(current?.notes, opts.note);
+    applied.push("note");
+  }
+  if (cols.has("updated_at")) patch.updated_at = new Date().toISOString();
+
+  if (applied.length === 0) {
+    return { applied };
+  }
+
+  const { error } = await supabase.from("leads").update(patch).eq("id", id);
+  if (error) throw new Error(error.message);
+  return { applied };
+}
+
+export interface SearchOpts {
+  query?: string;
+  status?: string;
+  hasEmail?: boolean;
+  hasWebsite?: boolean;
+  city?: string;
+  limit: number;
+}
+
+/** Filtered lead search for targeting. */
+export async function searchLeads(supabase: SupabaseClient, opts: SearchOpts): Promise<Lead[]> {
+  let q = supabase.from("leads").select(SELECT).order("created_at", { ascending: false });
+
+  if (opts.status) q = q.eq("status", opts.status);
+  if (opts.hasEmail === true) q = q.not("owner_email", "is", null);
+  if (opts.hasEmail === false) q = q.is("owner_email", null);
+  if (opts.hasWebsite === true) q = q.not("website_url", "is", null);
+  if (opts.hasWebsite === false) q = q.is("website_url", null);
+  if (opts.city) q = q.ilike("city", `%${opts.city}%`);
+  if (opts.query) {
+    const term = opts.query.replace(/[%,]/g, " ");
+    q = q.or(
+      `business_name.ilike.%${term}%,owner_name.ilike.%${term}%,owner_email.ilike.%${term}%,category.ilike.%${term}%`
+    );
+  }
+  q = q.limit(opts.limit);
+
+  const { data, error } = await q;
+  if (error) throw new Error(error.message);
+  return (data as unknown as Lead[]) ?? [];
+}
+
+// ── Generated sites ─────────────────────────────────────────────────────────
+
+const SITE_COLUMNS = [
+  "id",
+  "lead_id",
+  "business_name",
+  "city",
+  "site_slug",
+  "preview_slug",
+  "custom_domain",
+  "is_published_on_free",
+  "published_at",
+  "is_done",
+  "deleted_at",
+  "updated_at",
+] as const;
+
+export interface GeneratedSite {
+  id: string;
+  business: string | null;
+  url: string | null;
+  status: string;
+  lead_id: string | null;
+  updated_at: string | null;
+}
+
+function siteUrl(row: Record<string, unknown>): string | null {
+  if (row.custom_domain) return `https://${String(row.custom_domain).replace(/^https?:\/\//, "")}`;
+  const slug = row.preview_slug || row.site_slug;
+  if (slug) return `https://mahinatar.com/s/${slug}`;
+  return null;
+}
+
+function siteStatus(row: Record<string, unknown>): string {
+  if (row.published_at || row.is_published_on_free) return "published";
+  if (row.is_done) return "done";
+  return "draft";
+}
+
+/** List the user's generated sites (RLS-scoped). Defensive about columns. */
+export async function listGeneratedSites(
+  supabase: SupabaseClient,
+  opts: { status?: string; limit: number }
+): Promise<GeneratedSite[]> {
+  const cols = await existingColumns(supabase, "generated_sites", SITE_COLUMNS);
+  const selectCols = SITE_COLUMNS.filter((c) => cols.has(c));
+  let q = supabase
+    .from("generated_sites")
+    .select(selectCols.join(", "))
+    .order("updated_at", { ascending: false });
+
+  if (cols.has("deleted_at")) q = q.is("deleted_at", null);
+  q = q.limit(opts.limit);
+
+  const { data, error } = await q;
+  if (error) throw new Error(error.message);
+
+  let rows = (data as unknown as Record<string, unknown>[]) ?? [];
+  const mapped: GeneratedSite[] = rows.map((r) => ({
+    id: String(r.id),
+    business: (r.business_name as string) ?? null,
+    url: siteUrl(r),
+    status: siteStatus(r),
+    lead_id: (r.lead_id as string) ?? null,
+    updated_at: (r.updated_at as string) ?? null,
+  }));
+
+  if (opts.status) {
+    return mapped.filter((s) => s.status === opts.status);
+  }
+  return mapped;
 }
