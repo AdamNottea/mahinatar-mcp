@@ -97,11 +97,32 @@ function isExpiringSoon(jwt: string, skewSec = 60): boolean {
 }
 
 /**
+ * In-flight refresh guard. Supabase refresh tokens are SINGLE-USE and rotate on
+ * every exchange; using one twice trips reuse-detection and revokes the ENTIRE
+ * token family. ensureFreshToken() fires on every tool call (and again inside
+ * getSession/doTokenSignIn's retry), so without this lock two concurrent calls
+ * would both POST a refresh with the same RT → family revoked → "token expired"
+ * every session. Collapsing concurrent refreshes onto one promise spends the RT
+ * exactly once.
+ */
+let refreshInFlight: Promise<boolean> | null = null;
+
+/**
  * Exchange the refresh token for a fresh access+refresh pair, persist it, and
  * invalidate the data client so the new bearer is used. Returns false (no throw)
- * if refresh fails — the caller surfaces a clean auth error.
+ * if refresh fails — the caller surfaces a clean auth error. Serialized: a second
+ * caller while a refresh is running awaits the same exchange instead of starting
+ * a second one with the (about-to-rotate) same refresh token.
  */
-async function refreshTokens(): Promise<boolean> {
+function refreshTokens(): Promise<boolean> {
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = doRefresh().finally(() => {
+    refreshInFlight = null;
+  });
+  return refreshInFlight;
+}
+
+async function doRefresh(): Promise<boolean> {
   if (!tokens.refreshToken) return false;
   const { data, error } = await getAuthClient().auth.refreshSession({
     refresh_token: tokens.refreshToken,
