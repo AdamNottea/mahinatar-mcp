@@ -162,7 +162,7 @@ export function registerTools(server: McpServer): void {
     },
     async ({ id, subject, body, to }) =>
       guarded(async () => {
-        const { supabase } = await requireElite();
+        const { supabase, session } = await requireElite();
         const lead = await fetchLead(supabase, id);
         if (!lead) return err(`No lead found with id ${id}.`);
 
@@ -195,6 +195,15 @@ export function registerTools(server: McpServer): void {
 
         const result = await sendViaResend({ to: recipient, subject, body });
         sendsThisRun += 1;
+
+        // Record the send in outreach_log so it shows up in the app's Cold
+        // Outreach activity feed. Fire-and-forget — logging must never break a send.
+        try {
+          await supabase.from("outreach_log").insert({
+            user_id: session.userId, lead_id: id, channel: "mcp", status: "sent",
+            recipient, subject, body, template_used: "mcp",
+          } as never);
+        } catch { /* never break a send on a logging failure */ }
 
         // Best-effort: mark contacted (only updates columns that exist).
         let marked = true;
