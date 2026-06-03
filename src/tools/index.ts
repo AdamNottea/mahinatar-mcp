@@ -214,7 +214,7 @@ export function registerTools(server: McpServer): void {
     {
       title: "Mahinatar: mark contacted",
       description:
-        "Mark a lead as contacted and optionally append a note. Sets status='contacted' and outreach_status='sent'.",
+        "Mark a lead as contacted (sets outreach_status='sent') and optionally append a note.",
       inputSchema: {
         id: z.string().describe("Lead id (uuid)."),
         note: z.string().optional().describe("Optional note to store on the lead."),
@@ -225,10 +225,13 @@ export function registerTools(server: McpServer): void {
         const { supabase } = await requireElite();
         const lead = await fetchLead(supabase, id);
         if (!lead) return err(`No lead found with id ${id}.`);
-        // outreach_status is constrained to not_sent|drafted|sent|replied|bounced;
-        // "contacted" is invalid and throws. status is free-text so it's fine there.
-        const { applied } = await updateLead(supabase, id, { status: "contacted", stage: "sent", note });
-        return ok({ id, status: "contacted", applied, noteSaved: Boolean(note) });
+        // Only touch outreach_status='sent' — the "we reached out" signal.
+        // Do NOT set status: the lead_status enum has no 'contacted' value
+        // (new|called|no_answer|follow_up|interested|sold|site_*|disqualified|
+        // scheduled), and outreach_status's CHECK is not_sent|drafted|sent|
+        // replied|bounced. 'contacted' is invalid for BOTH columns.
+        const { applied } = await updateLead(supabase, id, { stage: "sent", note });
+        return ok({ id, outreach_status: "sent", applied, noteSaved: Boolean(note) });
       })
   );
 
