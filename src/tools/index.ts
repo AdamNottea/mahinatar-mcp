@@ -214,7 +214,7 @@ export function registerTools(server: McpServer): void {
     {
       title: "Mahinatar: mark contacted",
       description:
-        "Mark a lead as contacted and optionally append a note. Thin wrapper over update_lead (sets stage='contacted').",
+        "Mark a lead as contacted and optionally append a note. Sets status='contacted' and outreach_status='sent'.",
       inputSchema: {
         id: z.string().describe("Lead id (uuid)."),
         note: z.string().optional().describe("Optional note to store on the lead."),
@@ -225,7 +225,9 @@ export function registerTools(server: McpServer): void {
         const { supabase } = await requireElite();
         const lead = await fetchLead(supabase, id);
         if (!lead) return err(`No lead found with id ${id}.`);
-        const { applied } = await updateLead(supabase, id, { stage: "contacted", note });
+        // outreach_status is constrained to not_sent|drafted|sent|replied|bounced;
+        // "contacted" is invalid and throws. status is free-text so it's fine there.
+        const { applied } = await updateLead(supabase, id, { status: "contacted", stage: "sent", note });
         return ok({ id, status: "contacted", applied, noteSaved: Boolean(note) });
       })
   );

@@ -146,9 +146,12 @@ export async function markLeadContacted(
   // Build the richest patch, then strip unknown columns if the DB rejects them.
   const patches: Record<string, unknown>[] = [];
 
+  // outreach_status is constrained to not_sent|drafted|sent|replied|bounced —
+  // "contacted" is NOT valid and throws a check-constraint error. "sent" is the
+  // correct post-outreach value. status is free-text so "contacted" is ok there.
   const rich: Record<string, unknown> = {
     status: "contacted",
-    outreach_status: "contacted",
+    outreach_status: "sent",
     last_contacted_at: nowIso,
   };
   if (opts.note) rich.notes = opts.note;
@@ -157,7 +160,7 @@ export async function markLeadContacted(
   // Fallback 1: drop last_contacted_at (may not exist).
   const mid: Record<string, unknown> = {
     status: "contacted",
-    outreach_status: "contacted",
+    outreach_status: "sent",
   };
   if (opts.note) mid.notes = opts.note;
   patches.push(mid);

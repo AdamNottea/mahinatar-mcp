@@ -39,10 +39,13 @@ function firstName(name: string | null): string | null {
 }
 
 function hasUsableWebsite(lead: Lead): boolean {
-  // Treat clearly-bad site signals as "no real website".
-  const bad = /no[_-]?site|none|missing|broken|directory|placeholder/i;
+  // A real URL means they have a site. Do NOT infer "no site" from site_quality:
+  // the scanner sets POOR_SITE whenever it gets no signal (e.g. PageSpeed fetch
+  // failed), which means "couldn't measure", not "no site". Treating that as
+  // no-site made drafts falsely claim "I couldn't find a real website" to firms
+  // that have established sites. Only an explicit no-site website_status counts.
+  const bad = /\bnone\b|missing|broken|directory|placeholder|no[_-]?site/i;
   if (lead.website_status && bad.test(lead.website_status)) return false;
-  if (lead.site_quality && /poor|bad|none|low/i.test(lead.site_quality)) return false;
   return Boolean(lead.website_url || lead.website);
 }
 

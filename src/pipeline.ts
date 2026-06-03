@@ -37,6 +37,19 @@ const CONTACTED_STATUSES = new Set([
   "scheduled",
 ]);
 
+// Valid outreach_status values that mean "we've reached out" (per the
+// leads_outreach_status_check DB constraint: not_sent|drafted|sent|replied|bounced).
+// "contacted" is NOT a valid outreach_status — it was used here before and
+// silently never matched. "sent"/"replied"/"bounced" are the real signals.
+const CONTACTED_OUTREACH = new Set(["sent", "replied", "bounced"]);
+
+function isContactedLead(r: { status?: string | null; outreach_status?: string | null }): boolean {
+  return (
+    (!!r.status && CONTACTED_STATUSES.has(r.status)) ||
+    (!!r.outreach_status && CONTACTED_OUTREACH.has(r.outreach_status))
+  );
+}
+
 function daysAgo(iso: string | null | undefined): number | null {
   if (!iso) return null;
   const t = new Date(iso).getTime();
@@ -69,7 +82,7 @@ export async function pipelineSummary(supabase: SupabaseClient): Promise<unknown
     const s = r.status ?? "unknown";
     byStatus[s] = (byStatus[s] ?? 0) + 1;
     if (r.owner_email) withEmail += 1;
-    if ((r.status && CONTACTED_STATUSES.has(r.status)) || r.outreach_status === "contacted") {
+    if (isContactedLead(r)) {
       contacted += 1;
     }
     if (r.status === "sold") sold += 1;
@@ -121,34 +134,48 @@ export async function nextActions(
     const status = r.status ?? "new";
     if (CLOSED_STATUSES.has(status)) continue;
 
-    const noRealSite =
-      !r.website_url ||
-      /no[_-]?site|none|missing|broken|directory|placeholder/i.test(r.website_status ?? "") ||
-      /poor|bad|none|low/i.test(r.site_quality ?? "");
-    const isContacted =
-      CONTACTED_STATUSES.has(status) || r.outreach_status === "contacted";
+    // "No website" must be PROVABLE from the data, not inferred from a low
+    // quality score. site_quality is set to POOR_SITE whenever the scanner gets
+    // no signal (e.g. PageSpeed fetch failed) — that means "couldn't measure",
+    // NOT "no site". Trusting it produced false "no real website" claims against
+    // firms that have established sites. So: only count it as no-website when the
+    // URL is absent or website_status explicitly says the site is gone.
+    const statusSaysNoSite =
+      /\bnone\b|missing|broken|directory|placeholder|no[_-]?site/i.test(r.website_status ?? "");
+    const noWebsite = !r.website_url || statusSaysNoSite;
+    // Has a real URL but the scan rated it poorly: pitch a rebuild, not "you have
+    // no site". Phrased as an offer so it's honest even if the rating is noisy.
+    const weakSite = !noWebsite && /poor|bad|low/i.test(r.site_quality ?? "");
+    const isContacted = isContactedLead(r);
     const stale = daysAgo(r.updated_at);
 
-    if (!isContacted && noRealSite) {
+    if (!isContacted && noWebsite) {
       items.push({
         lead_id: r.id,
         business: r.business_name,
-        why_now: `High-value: no real website + has email${r.city ? ` (${r.city})` : ""}. Pitch a site now.`,
+        why_now: `No website live + has email${r.city ? ` (${r.city})` : ""}. Pitch a new site now.`,
         priority: 1,
+      });
+    } else if (!isContacted && weakSite) {
+      items.push({
+        lead_id: r.id,
+        business: r.business_name,
+        why_now: `Has a site but it scored poorly${r.city ? ` (${r.city})` : ""}. Pitch a modern rebuild.`,
+        priority: 2,
       });
     } else if (!isContacted) {
       items.push({
         lead_id: r.id,
         business: r.business_name,
         why_now: `Uncontacted + has email${r.city ? ` (${r.city})` : ""}. Ready to reach out.`,
-        priority: 2,
+        priority: 3,
       });
     } else if (isContacted && stale != null && stale >= 5) {
       items.push({
         lead_id: r.id,
         business: r.business_name,
         why_now: `Contacted ~${stale}d ago, no reply yet. Send a follow-up.`,
-        priority: 3,
+        priority: 4,
       });
     }
   }
@@ -177,9 +204,7 @@ export async function dueFollowups(
   const out: { lead_id: string; business: string | null; days_since: number; status: string | null }[] = [];
   for (const r of rows) {
     const status = r.status ?? "";
-    const isContacted =
-      CONTACTED_STATUSES.has(status) || r.outreach_status === "contacted";
-    if (!isContacted) continue;
+    if (!isContactedLead(r)) continue;
     if (CLOSED_STATUSES.has(status)) continue;
     const since = daysAgo(r.updated_at);
     if (since == null || since < days) continue;
