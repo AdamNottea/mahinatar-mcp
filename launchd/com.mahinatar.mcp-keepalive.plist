@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Mahinatar MCP keep-alive. Refreshes the Supabase session token every 6h so the
+  connector never expires from inactivity, even when Claude Code is closed.
+
+  Install:
+    cp launchd/com.mahinatar.mcp-keepalive.plist ~/Library/LaunchAgents/
+    launchctl unload ~/Library/LaunchAgents/com.mahinatar.mcp-keepalive.plist 2>/dev/null
+    launchctl load -w ~/Library/LaunchAgents/com.mahinatar.mcp-keepalive.plist
+  Logs: ~/.mahinatar-mcp/keepalive.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mahinatar.mcp-keepalive</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/Users/adamnottea/.mahinatar-mcp/dist/keepalive.js</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>21600</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/adamnottea/.mahinatar-mcp/keepalive.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/adamnottea/.mahinatar-mcp/keepalive.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

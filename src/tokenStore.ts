@@ -28,16 +28,44 @@ export interface Tokens {
 
 const CACHE_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", ".token-cache.json");
 
+/** JWT `exp` (seconds) or 0 if unparseable. Used to pick the fresher token. */
+export function jwtExp(jwt: string | null | undefined): number {
+  if (!jwt) return 0;
+  try {
+    const payload = JSON.parse(Buffer.from(jwt.split(".")[1], "base64url").toString("utf8"));
+    return typeof payload.exp === "number" ? payload.exp : 0;
+  } catch {
+    return 0;
+  }
+}
+
 /**
- * Returns the live tokens: cache file if present, else the env seed.
- * Read fresh each call so a refresh persisted by another path is seen.
+ * Choose the live token pair: whichever of {cache, env seed} has the LATER
+ * access-token expiry wins. This is the load-bearing fix for "reconnect doesn't
+ * stick": previously the cache was preferred unconditionally, so a stale cached
+ * (already-revoked) token shadowed a FRESH reconnect that had just written new
+ * tokens into the connector env — the server kept failing with "token expired"
+ * even right after reconnecting. Now a fresh env seed (later exp) overrides a
+ * stale cache, and a cache refreshed in-flight still beats an old env seed.
+ */
+export function pickFresherTokens(cache: Tokens | null, envSeed: Tokens): Tokens {
+  if (!cache || !cache.accessToken) return envSeed;
+  if (!envSeed.accessToken) return cache;
+  return jwtExp(envSeed.accessToken) > jwtExp(cache.accessToken) ? envSeed : cache;
+}
+
+/**
+ * Returns the live tokens: the FRESHER of the cache file and the env seed (see
+ * pickFresherTokens). Read fresh each call so a refresh persisted by another
+ * path (the MCP server or the keep-alive agent) is seen.
  */
 export function loadTokens(envSeed: Tokens): Tokens {
+  let cache: Tokens | null = null;
   try {
     if (existsSync(CACHE_PATH)) {
       const raw = JSON.parse(readFileSync(CACHE_PATH, "utf8"));
       if (raw && typeof raw.accessToken === "string" && raw.accessToken) {
-        return {
+        cache = {
           accessToken: raw.accessToken,
           refreshToken: typeof raw.refreshToken === "string" ? raw.refreshToken : "",
         };
@@ -46,7 +74,7 @@ export function loadTokens(envSeed: Tokens): Tokens {
   } catch {
     // Corrupt/unreadable cache — fall back to the env seed.
   }
-  return envSeed;
+  return pickFresherTokens(cache, envSeed);
 }
 
 /** Persist a rotated token pair so future sign-ins start valid. Never throws. */
