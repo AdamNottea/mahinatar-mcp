@@ -22,6 +22,7 @@
  */
 
 import { createClient } from "@supabase/supabase-js";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +33,30 @@ interface Boot {
   url: string;
   anon: string;
   tokens: Tokens;
+}
+
+/**
+ * Is the live MCP server (spawned by Claude Code) currently running?
+ *
+ * Refresh tokens are single-use and rotate on every exchange. While the server
+ * is up it refreshes its own session in-process and writes each rotated pair to
+ * the cache — so if the keep-alive ALSO refreshes at the same time it consumes
+ * the cache's refresh token out from under the server's stale in-memory copy,
+ * and the server then dies on its next refresh ("Already Used"). That race is
+ * exactly what kills the connector ~daily. So the keep-alive only acts when the
+ * server is DOWN (Claude Code closed) — when CC is open the server owns tokens.
+ */
+function serverRunning(): boolean {
+  try {
+    const out = execFileSync("pgrep", ["-f", "mahinatar-mcp/dist/index.js"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.trim().length > 0;
+  } catch {
+    // pgrep exits non-zero when no match — that means the server is not running.
+    return false;
+  }
 }
 
 /** Find the mahinatar MCP env block anywhere in ~/.claude.json (it lives under
@@ -63,6 +88,13 @@ function fromClaudeJson(): Boot | null {
 
 async function main(): Promise<void> {
   const ts = new Date().toISOString();
+
+  // Don't fight the live server for the single-use refresh token (see serverRunning).
+  if (serverRunning()) {
+    console.log(`[${ts}] keepalive: MCP server is running — it owns token refresh; skipping.`);
+    return;
+  }
+
   const boot = fromClaudeJson();
   const url = config.supabaseUrl || boot?.url || "";
   const anon = config.supabaseAnonKey || boot?.anon || "";
