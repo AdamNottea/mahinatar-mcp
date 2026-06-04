@@ -22,11 +22,15 @@ export function canSendLive(): { ok: boolean; reason: string | null } {
 
 // Basic deliverability guard: reject obviously-malformed addresses before they
 // turn into hard bounces (repeat hard bounces wreck the sending domain's rep).
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Local part excludes %/<>// so scrape artifacts ("%20maxbizz@mail.com", maps
+// URLs) are rejected; sentinels like "<UNKNOWN>" are denied explicitly.
+const EMAIL_RE = /^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+const EMAIL_SENTINELS = new Set(["<unknown>", "unknown", "n/a", "na", "none", "null", "-"]);
 export function isSendableEmail(email: string | null | undefined): boolean {
   if (!email) return false;
   const e = email.trim();
   if (!e || e.length > 254) return false;
+  if (EMAIL_SENTINELS.has(e.toLowerCase())) return false;
   return EMAIL_RE.test(e);
 }
 
@@ -85,6 +89,7 @@ export async function sendViaResend(args: {
     body: JSON.stringify({
       from: config.fromEmail,
       to: [args.to],
+      ...(config.replyTo ? { reply_to: config.replyTo } : {}),
       subject: args.subject,
       text: withComplianceFooter(args.body),
       headers: buildComplianceHeaders(),

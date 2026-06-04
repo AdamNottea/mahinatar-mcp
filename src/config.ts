@@ -15,6 +15,8 @@ export interface Config {
   /** Master safety switch: only the literal "true" enables live send. */
   outreachLive: boolean;
   fromEmail: string | undefined;
+  /** Reply-To — from-domain has no inbound MX, so replies need a real inbox. */
+  replyTo: string | undefined;
   /** Optional https one-click unsubscribe endpoint (RFC 8058). */
   unsubscribeUrl: string | undefined;
   /** Physical postal address appended to every live send (CAN-SPAM requirement). */
@@ -35,6 +37,7 @@ export const config: Config = {
   resendApiKey: req("RESEND_API_KEY") || undefined,
   outreachLive: req("MAHINATAR_OUTREACH_LIVE").toLowerCase() === "true",
   fromEmail: req("MAHINATAR_FROM_EMAIL") || undefined,
+  replyTo: req("MAHINATAR_REPLY_TO") || undefined,
   unsubscribeUrl: req("MAHINATAR_UNSUBSCRIBE_URL") || undefined,
   postalAddress: req("MAHINATAR_POSTAL_ADDRESS") || undefined,
 };

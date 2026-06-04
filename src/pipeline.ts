@@ -6,6 +6,7 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { existingColumns, type Lead } from "./leads.js";
+import { isSendableEmail } from "./email.js";
 
 const ALL_SELECT = [
   "id",
@@ -81,7 +82,7 @@ export async function pipelineSummary(supabase: SupabaseClient): Promise<unknown
   for (const r of rows) {
     const s = r.status ?? "unknown";
     byStatus[s] = (byStatus[s] ?? 0) + 1;
-    if (r.owner_email) withEmail += 1;
+    if (isSendableEmail(r.owner_email)) withEmail += 1;
     if (isContactedLead(r)) {
       contacted += 1;
     }
@@ -130,7 +131,7 @@ export async function nextActions(
 
   const items: ActionItem[] = [];
   for (const r of rows) {
-    if (!r.owner_email) continue; // need a way to reach them
+    if (!isSendableEmail(r.owner_email)) continue; // need a real way to reach them (rejects <UNKNOWN>/junk)
     const status = r.status ?? "new";
     if (CLOSED_STATUSES.has(status)) continue;
 
