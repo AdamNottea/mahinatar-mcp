@@ -7,7 +7,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import { getSession, getAuthedClient, requireElite, AuthError } from "../supabase.js";
+import { getSession, getAuthedClient, requireElite, getAccessToken, AuthError } from "../supabase.js";
 import { canSendLive, sendViaResend, isSendableEmail } from "../email.js";
 import { config, MAX_SENDS_PER_RUN } from "../config.js";
 import {
@@ -21,6 +21,11 @@ import {
 } from "../leads.js";
 import { pipelineSummary, nextActions, dueFollowups } from "../pipeline.js";
 import { buildDraft, type Tone } from "../draft.js";
+import { verifyEmails, verifyEmailDeliverable } from "../verify.js";
+import {
+  createLead, importLeads, bulkUpdateLeads, findDuplicateLeads,
+  fetchSiteDetail, creditStatus, generateSite, publishSite, deleteSite, startScan,
+} from "../control.js";
 
 /** In-memory live-send counter for this server run (throttle). */
 let sendsThisRun = 0;
@@ -189,6 +194,10 @@ export function registerTools(server: McpServer): void {
         }
         if (!isSendableEmail(recipient)) {
           return ok({ sent: false, dryRun: false, skipped: true, reason: `Skipped: '${recipient}' is not a valid email (would hard-bounce).` });
+        }
+        const mx = await verifyEmailDeliverable(recipient);
+        if (!mx.deliverable) {
+          return ok({ sent: false, dryRun: false, skipped: true, reason: `Skipped: '${recipient}' is undeliverable (${mx.reason}).` });
         }
         if (sendsThisRun >= MAX_SENDS_PER_RUN) {
           return err(
@@ -421,6 +430,261 @@ export function registerTools(server: McpServer): void {
         const { supabase } = await requireElite();
         const sites = await listGeneratedSites(supabase, { status, limit: Math.min(limit ?? 25, 100) });
         return ok({ count: sites.length, sites });
+      })
+  );
+
+  // ── 14. bulk_send_outreach — parity with the remote server ──────────────────
+  server.registerTool(
+    "mahinatar_bulk_send_outreach",
+    {
+      title: "Mahinatar: bulk send outreach",
+      description:
+        "Send (or dry-run) outreach to a BATCH of emailable leads. Auto-drafts each email, then sends. DRY-RUN BY DEFAULT — only delivers when live mode + Resend are configured (check mahinatar_whoami.live_send_enabled first). Throttled to MAX_SENDS_PER_RUN, suppression-aware, MX-verified, skips leads with no email, marks each sent lead contacted.",
+      inputSchema: {
+        tone: z.enum(["direct", "friendly", "short"]).optional(),
+        angle: z.string().optional(),
+        hasWebsite: z.boolean().optional(),
+        city: z.string().optional(),
+        status: z.string().optional(),
+        limit: z.number().int().min(1).max(20).optional(),
+      },
+    },
+    async ({ tone, angle, hasWebsite, city, status, limit }) =>
+      guarded(async () => {
+        const { supabase, session } = await requireElite();
+        const cap = Math.min(limit ?? 10, MAX_SENDS_PER_RUN);
+        const rows = await searchLeads(supabase, { hasEmail: true, hasWebsite, city, status, limit: cap });
+        const live = canSendLive();
+        const results: Record<string, unknown>[] = [];
+        for (const lead of rows) {
+          if (sendsThisRun >= MAX_SENDS_PER_RUN) { results.push({ id: lead.id, business_name: lead.business_name, sent: false, skipped: true, reason: `run throttle hit (${MAX_SENDS_PER_RUN})` }); continue; }
+          const recipient = lead.owner_email;
+          if (!recipient) { results.push({ id: lead.id, business_name: lead.business_name, sent: false, skipped: true, reason: "no owner_email" }); continue; }
+          if (!isSendableEmail(recipient)) { results.push({ id: lead.id, business_name: lead.business_name, sent: false, skipped: true, reason: "invalid email (would hard-bounce)" }); continue; }
+          const suppression = suppressionReason(lead);
+          if (suppression) { results.push({ id: lead.id, business_name: lead.business_name, sent: false, skipped: true, reason: `suppressed: ${suppression}` }); continue; }
+          const draft = buildDraft(lead, (tone ?? "friendly") as Tone, angle);
+          if (!live.ok) { results.push({ id: lead.id, business_name: lead.business_name, sent: false, dryRun: true, to: recipient, subject: draft.subject }); continue; }
+          const mx = await verifyEmailDeliverable(recipient);
+          if (!mx.deliverable) { results.push({ id: lead.id, business_name: lead.business_name, sent: false, skipped: true, reason: `undeliverable: ${mx.reason}` }); continue; }
+          try {
+            const r = await sendViaResend({ to: recipient, subject: draft.subject, body: draft.body });
+            sendsThisRun += 1;
+            try { await supabase.from("outreach_log").insert({ user_id: session.userId, lead_id: lead.id, channel: "mcp", status: "sent", recipient, subject: draft.subject, body: draft.body, template_used: "mcp" } as never); } catch { /* logging must never break a send */ }
+            let marked = true; try { await markLeadContacted(supabase, lead.id); } catch { marked = false; }
+            results.push({ id: lead.id, business_name: lead.business_name, sent: true, to: recipient, providerId: r.id, leadMarkedContacted: marked });
+          } catch (e) { results.push({ id: lead.id, business_name: lead.business_name, sent: false, error: (e as Error).message }); }
+        }
+        return ok({ live: live.ok, dryRun: !live.ok, dryRunReason: live.ok ? null : live.reason, matched: rows.length, sent: results.filter((r) => r.sent).length, dryRunPreviews: results.filter((r) => r.dryRun).length, skipped: results.filter((r) => r.skipped).length, sendsThisRun, results });
+      })
+  );
+
+  // ── 15. enrich_leads — parity with the remote server ────────────────────────
+  server.registerTool(
+    "mahinatar_enrich_leads",
+    {
+      title: "Mahinatar: enrich leads (find emails)",
+      description:
+        "Find owner emails for leads that have none (the real bottleneck before outreach). Runs the Apify-backed enrichment on your no-email leads and writes any found owner_email/owner_phone back. Costs enrichment credits.",
+      inputSchema: { limit: z.number().int().min(1).max(25).optional(), force: z.boolean().optional() },
+    },
+    async ({ limit, force }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        const rows = await searchLeads(supabase, { hasEmail: false, limit: Math.min(limit ?? 15, 25) });
+        const leadIds = rows.map((r) => r.id);
+        if (leadIds.length === 0) return ok({ requested: 0, message: "No leads without an email to enrich." });
+        const accessToken = await getAccessToken();
+        const res = await fetch(`${config.supabaseUrl}/functions/v1/enrich-leads-apify`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ lead_ids: leadIds, force: force ?? false }),
+        });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) return err(`Enrichment failed (${res.status}): ${(json as { error?: string }).error ?? "see app logs."}`);
+        return ok({ requested: leadIds.length, ...(json as Record<string, unknown>) });
+      })
+  );
+
+  // ── 16. verify_emails — real MX/SMTP deliverability check ────────────────────
+  server.registerTool(
+    "mahinatar_verify_emails",
+    {
+      title: "Mahinatar: verify emails (MX)",
+      description:
+        "Verify that addresses can actually receive mail (MX/A-record lookup + disposable-domain block) BEFORE you queue a send. Pass explicit `emails`, or `ids` to verify those leads' owner_email. Returns deliverable + reason per address.",
+      inputSchema: { emails: z.array(z.string()).optional(), ids: z.array(z.string()).optional() },
+    },
+    async ({ emails, ids }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        let list: string[] = emails ?? [];
+        if ((!emails || emails.length === 0) && ids && ids.length > 0) {
+          const leads = await Promise.all(ids.slice(0, 100).map((id) => fetchLead(supabase, id)));
+          list = leads.map((l) => l?.owner_email).filter((e): e is string => Boolean(e));
+        }
+        if (list.length === 0) return err("Provide `emails` (array) or `ids` (leads with owner_email) to verify.");
+        const r = await verifyEmails(list.slice(0, 100));
+        return ok({ count: r.length, deliverable: r.filter((x) => x.deliverable).length, undeliverable: r.filter((x) => !x.deliverable).length, results: r });
+      })
+  );
+
+  // ── 17. create_lead ─────────────────────────────────────────────────────────
+  server.registerTool(
+    "mahinatar_create_lead",
+    {
+      title: "Mahinatar: create lead",
+      description: "Add a single lead to your pipeline. business_name required; rest optional.",
+      inputSchema: { business_name: z.string(), owner_name: z.string().optional(), owner_email: z.string().optional(), owner_phone: z.string().optional(), website_url: z.string().optional(), city: z.string().optional(), state: z.string().optional(), category: z.string().optional(), notes: z.string().optional(), status: z.string().optional() },
+    },
+    async (a) =>
+      guarded(async () => {
+        const { supabase, session } = await requireElite();
+        const lead = await createLead(supabase, session.userId, a);
+        return ok({ created: true, lead });
+      })
+  );
+
+  // ── 18. import_leads (bulk) ──────────────────────────────────────────────────
+  server.registerTool(
+    "mahinatar_import_leads",
+    {
+      title: "Mahinatar: import leads (bulk)",
+      description: "Bulk-import leads (e.g. a pasted CSV). De-dupes within the batch by email else business_name+city. Each row needs business_name.",
+      inputSchema: { leads: z.array(z.object({ business_name: z.string(), owner_name: z.string().optional(), owner_email: z.string().optional(), owner_phone: z.string().optional(), website_url: z.string().optional(), city: z.string().optional(), state: z.string().optional(), category: z.string().optional(), notes: z.string().optional(), status: z.string().optional() })).min(1).max(500) },
+    },
+    async ({ leads }) =>
+      guarded(async () => {
+        const { supabase, session } = await requireElite();
+        return ok(await importLeads(supabase, session.userId, leads));
+      })
+  );
+
+  // ── 19. bulk_update_leads ────────────────────────────────────────────────────
+  server.registerTool(
+    "mahinatar_bulk_update_leads",
+    {
+      title: "Mahinatar: bulk update leads",
+      description: "Apply the same status and/or stage (outreach_status) to many leads at once. For per-lead notes use mahinatar_update_lead.",
+      inputSchema: { ids: z.array(z.string()).min(1).max(500), status: z.string().optional(), stage: z.string().optional() },
+    },
+    async ({ ids, status, stage }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        if (!status && !stage) return err("Provide status and/or stage to apply.");
+        return ok(await bulkUpdateLeads(supabase, ids, { status, stage }));
+      })
+  );
+
+  // ── 20. find_duplicate_leads ─────────────────────────────────────────────────
+  server.registerTool(
+    "mahinatar_find_duplicate_leads",
+    {
+      title: "Mahinatar: find duplicate leads",
+      description: "Report likely-duplicate leads (same owner_email, or same business_name+city). Read-only — returns groups so you decide what to merge. Never auto-deletes.",
+      inputSchema: { scanLimit: z.number().int().min(1).max(5000).optional() },
+    },
+    async ({ scanLimit }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        const r = await findDuplicateLeads(supabase, scanLimit ?? 2000);
+        return ok({ duplicate_groups: r.groups.length, scanned: r.scanned, groups: r.groups });
+      })
+  );
+
+  // ── 21. site_detail ──────────────────────────────────────────────────────────
+  server.registerTool(
+    "mahinatar_site_detail",
+    {
+      title: "Mahinatar: site detail",
+      description: "Full generated-site row by id, including computed public url, publish status, and stored html/site_data. Use to pull a preview URL to pitch.",
+      inputSchema: { id: z.string() },
+    },
+    async ({ id }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        const site = await fetchSiteDetail(supabase, id);
+        return site ? ok(site) : err(`No site found with id ${id}.`);
+      })
+  );
+
+  // ── 22. generate_site ────────────────────────────────────────────────────────
+  server.registerTool(
+    "mahinatar_generate_site",
+    {
+      title: "Mahinatar: generate site",
+      description: "Trigger website generation. Pass `lead_id` to build for an existing lead, or `business_name` to build from scratch. Costs generation credits.",
+      inputSchema: { lead_id: z.string().optional(), business_name: z.string().optional(), source_url: z.string().optional(), mode: z.enum(["lead", "scratch", "clone"]).optional() },
+    },
+    async (a) =>
+      guarded(async () => {
+        await requireElite();
+        if (!a.lead_id && !a.business_name) return err("Provide lead_id or business_name.");
+        const accessToken = await getAccessToken();
+        return ok(await generateSite(config.supabaseUrl, accessToken, a));
+      })
+  );
+
+  // ── 23. publish_site ─────────────────────────────────────────────────────────
+  server.registerTool(
+    "mahinatar_publish_site",
+    {
+      title: "Mahinatar: publish site",
+      description: "Publish a generated site to its free public URL.",
+      inputSchema: { site_id: z.string() },
+    },
+    async ({ site_id }) =>
+      guarded(async () => {
+        await requireElite();
+        const accessToken = await getAccessToken();
+        return ok(await publishSite(config.supabaseUrl, accessToken, site_id));
+      })
+  );
+
+  // ── 24. delete_site ──────────────────────────────────────────────────────────
+  server.registerTool(
+    "mahinatar_delete_site",
+    {
+      title: "Mahinatar: delete site",
+      description: "Delete a generated site and its dependent resources (irreversible). Verifies ownership server-side.",
+      inputSchema: { site_id: z.string() },
+    },
+    async ({ site_id }) =>
+      guarded(async () => {
+        await requireElite();
+        const accessToken = await getAccessToken();
+        return ok(await deleteSite(config.supabaseUrl, accessToken, site_id));
+      })
+  );
+
+  // ── 25. start_scan ───────────────────────────────────────────────────────────
+  server.registerTool(
+    "mahinatar_start_scan",
+    {
+      title: "Mahinatar: start scan",
+      description: "Start a Google-Maps / niche prospecting scan for a location + category (e.g. location='Austin, TX', category='plumbers'). Surfaces new leads. Costs scan credits.",
+      inputSchema: { location: z.string(), category: z.string(), batchMode: z.boolean().optional() },
+    },
+    async ({ location, category, batchMode }) =>
+      guarded(async () => {
+        await requireElite();
+        const accessToken = await getAccessToken();
+        return ok(await startScan(config.supabaseUrl, accessToken, { location, category, batchMode }));
+      })
+  );
+
+  // ── 26. credit_status ────────────────────────────────────────────────────────
+  server.registerTool(
+    "mahinatar_credit_status",
+    {
+      title: "Mahinatar: credit status",
+      description: "Current credit balance (subscription + purchased − used) for the connected account.",
+      inputSchema: {},
+    },
+    async () =>
+      guarded(async () => {
+        const { supabase, session } = await requireElite();
+        return ok(await creditStatus(supabase, session.userId));
       })
   );
 }

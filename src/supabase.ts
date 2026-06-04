@@ -269,6 +269,21 @@ export async function getAuthedClient(): Promise<{ supabase: SupabaseClient; ses
 }
 
 /**
+ * Current user access token, refreshed if near-expiry. Used by the control-plane
+ * edge-function wrappers (generate/publish/delete site, start scan) so the
+ * function authenticates as this user. Mirrors how the remote server passes its
+ * per-request bearer through to functions/v1/*.
+ */
+export async function getAccessToken(): Promise<string> {
+  await getSession();
+  await ensureFreshToken();
+  if (!tokens.accessToken) {
+    throw new AuthError("No access token available — set MAHINATAR_ACCESS_TOKEN to call edge functions.");
+  }
+  return tokens.accessToken;
+}
+
+/**
  * Elite gate. Ensures a session AND that the user is authorized for outreach.
  * Throws AuthError with the upgrade message if not.
  */
