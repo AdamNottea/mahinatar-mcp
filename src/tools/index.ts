@@ -26,6 +26,10 @@ import {
   createLead, importLeads, bulkUpdateLeads, findDuplicateLeads,
   fetchSiteDetail, creditStatus, generateSite, publishSite, deleteSite, startScan,
 } from "../control.js";
+import {
+  createCampaign, listCampaigns, campaignDetail, editCampaign,
+  setCampaignStatus, enrollLeads, campaignStatus,
+} from "../campaigns.js";
 
 /** In-memory live-send counter for this server run (throttle). */
 let sendsThisRun = 0;
@@ -685,6 +689,147 @@ export function registerTools(server: McpServer): void {
       guarded(async () => {
         const { supabase, session } = await requireElite();
         return ok(await creditStatus(supabase, session.userId));
+      })
+  );
+
+  // ── 27-34. Campaigns — multi-step drip sequences (sending happens in the
+  // scheduled campaign-drip-runner edge fn, NOT here). Parity with remote. ──
+  const campaignStepShape = z.object({ subject: z.string(), body: z.string(), wait_days: z.number().int().min(0).max(365).optional() });
+  const campaignPacing = {
+    daily_cap: z.number().int().min(1).max(500).optional(),
+    warmup_start: z.number().int().min(1).max(500).optional(),
+    warmup_growth: z.number().min(0).max(2).optional(),
+    jitter_min_sec: z.number().int().min(0).max(86400).optional(),
+    jitter_max_sec: z.number().int().min(0).max(86400).optional(),
+    from_email: z.string().optional(),
+  };
+
+  server.registerTool(
+    "mahinatar_create_campaign",
+    {
+      title: "Mahinatar: create campaign",
+      description:
+        "Create a multi-step email drip campaign (name + ordered steps, each with subject/body and an optional wait_days). Sending is paced by the scheduled drip-runner (jitter + warmup ramp + daily cap), NOT this call. Starts in 'draft' — enroll leads, then resume to activate.",
+      inputSchema: { name: z.string(), steps: z.array(campaignStepShape).min(1).max(20), ...campaignPacing },
+    },
+    async ({ name, steps, ...pacing }) =>
+      guarded(async () => {
+        const { supabase, session } = await requireElite();
+        return ok(await createCampaign(supabase, session.userId, { name, steps, ...pacing }));
+      })
+  );
+
+  server.registerTool(
+    "mahinatar_list_campaigns",
+    {
+      title: "Mahinatar: list campaigns",
+      description: "List your email campaigns (newest first) with status and pacing settings.",
+      inputSchema: { limit: z.number().int().min(1).max(200).optional() },
+    },
+    async ({ limit }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        const rows = await listCampaigns(supabase, limit ?? 50);
+        return ok({ count: rows.length, campaigns: rows });
+      })
+  );
+
+  server.registerTool(
+    "mahinatar_campaign_detail",
+    {
+      title: "Mahinatar: campaign detail",
+      description:
+        "Review a campaign in one spot: the campaign row, its ordered steps, enrollment counts by status, and send counts by status.",
+      inputSchema: { id: z.string() },
+    },
+    async ({ id }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        const d = await campaignDetail(supabase, id);
+        return d ? ok(d) : err(`No campaign found with id ${id}.`);
+      })
+  );
+
+  server.registerTool(
+    "mahinatar_edit_campaign",
+    {
+      title: "Mahinatar: edit campaign",
+      description:
+        "Patch a campaign's name/status/pacing (daily_cap, warmup, jitter, from_email). Only provided fields change. To change steps, recreate the campaign.",
+      inputSchema: { id: z.string(), name: z.string().optional(), status: z.enum(["draft", "active", "paused", "completed"]).optional(), ...campaignPacing },
+    },
+    async ({ id, ...patch }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        return ok(await editCampaign(supabase, id, patch));
+      })
+  );
+
+  server.registerTool(
+    "mahinatar_enroll_leads",
+    {
+      title: "Mahinatar: enroll leads in campaign",
+      description:
+        "Enroll leads into a campaign by explicit `lead_ids` OR a `filter` (search criteria; only emailable leads). Each enrollment schedules step 0 at now+jitter; a lead already enrolled is skipped (never double-sent).",
+      inputSchema: { campaign_id: z.string(), lead_ids: z.array(z.string()).optional(), filter: z.object({ status: z.string().optional(), hasWebsite: z.boolean().optional(), city: z.string().optional(), query: z.string().optional(), limit: z.number().int().min(1).max(500).optional() }).optional() },
+    },
+    async ({ campaign_id, lead_ids, filter }) =>
+      guarded(async () => {
+        const { supabase, session } = await requireElite();
+        const { data: c } = await supabase.from("email_campaigns").select("jitter_min_sec, jitter_max_sec").eq("id", campaign_id).maybeSingle();
+        if (!c) return err(`No campaign found with id ${campaign_id}.`);
+        const camp = c as { jitter_min_sec?: number; jitter_max_sec?: number };
+        let ids = lead_ids ?? [];
+        if (ids.length === 0 && filter) {
+          const rows = await searchLeads(supabase, { hasEmail: true, status: filter.status, hasWebsite: filter.hasWebsite, city: filter.city, query: filter.query, limit: Math.min(filter.limit ?? 100, 500) });
+          ids = rows.map((r) => r.id);
+        }
+        if (ids.length === 0) return err("Provide `lead_ids` or a `filter` that matches emailable leads.");
+        return ok(await enrollLeads(supabase, session.userId, campaign_id, ids, { jitterMinSec: camp.jitter_min_sec, jitterMaxSec: camp.jitter_max_sec }));
+      })
+  );
+
+  server.registerTool(
+    "mahinatar_pause_campaign",
+    {
+      title: "Mahinatar: pause campaign",
+      description: "Pause a campaign — the drip-runner stops sending its steps until resumed.",
+      inputSchema: { id: z.string() },
+    },
+    async ({ id }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        return ok(await setCampaignStatus(supabase, id, "paused"));
+      })
+  );
+
+  server.registerTool(
+    "mahinatar_resume_campaign",
+    {
+      title: "Mahinatar: resume campaign",
+      description: "Activate/resume a campaign so the drip-runner sends due steps.",
+      inputSchema: { id: z.string() },
+    },
+    async ({ id }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        return ok(await setCampaignStatus(supabase, id, "active"));
+      })
+  );
+
+  server.registerTool(
+    "mahinatar_campaign_status",
+    {
+      title: "Mahinatar: campaign status",
+      description:
+        "Per-enrollment state for a campaign: each lead's status, current step, and next scheduled send, plus a count by status.",
+      inputSchema: { id: z.string(), limit: z.number().int().min(1).max(1000).optional() },
+    },
+    async ({ id, limit }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        const s = await campaignStatus(supabase, id, limit ?? 200);
+        return s ? ok(s) : err(`No campaign found with id ${id}.`);
       })
   );
 }
