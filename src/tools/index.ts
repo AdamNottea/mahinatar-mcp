@@ -8,7 +8,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { getSession, getAuthedClient, requireElite, AuthError } from "../supabase.js";
-import { canSendLive, sendViaResend } from "../email.js";
+import { canSendLive, sendViaResend, isSendableEmail } from "../email.js";
 import { config, MAX_SENDS_PER_RUN } from "../config.js";
 import {
   listLeads,
@@ -186,6 +186,9 @@ export function registerTools(server: McpServer): void {
         }
         if (!recipient) {
           return err("Cannot send: lead has no owner_email and no `to` override was provided.");
+        }
+        if (!isSendableEmail(recipient)) {
+          return ok({ sent: false, dryRun: false, skipped: true, reason: `Skipped: '${recipient}' is not a valid email (would hard-bounce).` });
         }
         if (sendsThisRun >= MAX_SENDS_PER_RUN) {
           return err(

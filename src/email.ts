@@ -20,6 +20,47 @@ export function canSendLive(): { ok: boolean; reason: string | null } {
   return { ok: true, reason: null };
 }
 
+// Basic deliverability guard: reject obviously-malformed addresses before they
+// turn into hard bounces (repeat hard bounces wreck the sending domain's rep).
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export function isSendableEmail(email: string | null | undefined): boolean {
+  if (!email) return false;
+  const e = email.trim();
+  if (!e || e.length > 254) return false;
+  return EMAIL_RE.test(e);
+}
+
+/**
+ * Builds RFC 8058 one-click unsubscribe headers. Required by Gmail/Yahoo bulk
+ * rules and a CAN-SPAM-friendly signal. One-click POST is only emitted when an
+ * https endpoint exists (RFC 8058 forbids pairing List-Unsubscribe-Post with a
+ * mailto), otherwise a mailto fallback is used.
+ */
+export function buildComplianceHeaders(opts?: {
+  fromEmail?: string;
+  unsubscribeUrl?: string;
+}): Record<string, string> {
+  const fromEmail = opts?.fromEmail ?? config.fromEmail;
+  const url = opts?.unsubscribeUrl ?? config.unsubscribeUrl;
+  const domain = fromEmail?.split("@")[1];
+  const mailto = domain ? `mailto:unsubscribe@${domain}?subject=unsubscribe` : null;
+  const headers: Record<string, string> = {};
+  if (url) {
+    headers["List-Unsubscribe"] = mailto ? `<${url}>, <${mailto}>` : `<${url}>`;
+    headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click";
+  } else if (mailto) {
+    headers["List-Unsubscribe"] = `<${mailto}>`;
+  }
+  return headers;
+}
+
+/** Appends the configured physical postal address (CAN-SPAM) when set + absent. */
+function withComplianceFooter(body: string): string {
+  const addr = config.postalAddress;
+  if (!addr || body.includes(addr)) return body;
+  return `${body}\n\n—\n${addr}`;
+}
+
 export interface SendResult {
   id: string;
 }
@@ -45,7 +86,8 @@ export async function sendViaResend(args: {
       from: config.fromEmail,
       to: [args.to],
       subject: args.subject,
-      text: args.body,
+      text: withComplianceFooter(args.body),
+      headers: buildComplianceHeaders(),
     }),
   });
 

@@ -129,6 +129,11 @@ export async function listLeads(
 export function suppressionReason(lead: Lead): string | null {
   if (lead.do_not_contact === true) return "lead is marked do_not_contact";
   if (lead.unsubscribed === true) return "lead is unsubscribed";
+  // Never re-contact a lead we already emailed. 'bounced' especially must never
+  // be retried — repeat hard bounces wreck the sending domain's reputation.
+  const os = lead.outreach_status?.toLowerCase() ?? null;
+  if (os === "bounced") return "previous email bounced — never resend (protects domain reputation)";
+  if (os === "sent" || os === "replied") return `already contacted (outreach_status='${os}')`;
   return null;
 }
 
