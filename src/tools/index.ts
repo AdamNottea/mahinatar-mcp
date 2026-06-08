@@ -740,12 +740,12 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 24d. toggle_site_addon ───────────────────────────────────────────────────
-  gatedTool(server, 
+  gatedTool(server,
     "mahinatar_toggle_site_addon",
     {
       title: "Mahinatar: toggle site add-on",
-      description: "Enable or disable a site add-on (e.g. chatbot, analytics, custom domain). `action` is the add-on action string the app expects.",
-      inputSchema: { site_id: z.string(), action: z.string() },
+      description: "Enable or disable a site's chatbot add-on.",
+      inputSchema: { site_id: z.string(), action: z.enum(["enable_chatbot", "disable_chatbot"]) },
     },
     async ({ site_id, action }) =>
       guarded(async () => {
@@ -760,12 +760,12 @@ export function registerTools(server: McpServer): void {
     "mahinatar_analyze_website",
     {
       title: "Mahinatar: analyze website",
-      description: "Run a conversion/quality audit of a website. Pass a lead_id (audits the lead's site) or an explicit website_url.",
-      inputSchema: { lead_id: z.string().optional(), website_url: z.string().optional() },
+      description: "Run a conversion/quality audit of a lead's website. Requires lead_id (the audit pulls the lead's scraped content); website_url is an optional override. The lead needs scraped content on file or the audit returns 'not enough content'.",
+      inputSchema: { lead_id: z.string().describe("Lead id (uuid) — required."), website_url: z.string().optional().describe("Optional URL override.") },
     },
     async ({ lead_id, website_url }) =>
       guarded(async () => {
-        if (!lead_id && !website_url) return err("Provide lead_id or website_url.");
+        if (!lead_id) return err("lead_id is required for analyze_website.");
         await requireElite();
         const accessToken = await getAccessToken();
         return ok(await analyzeWebsite(config.supabaseUrl, accessToken, { leadId: lead_id, websiteUrl: website_url }));
