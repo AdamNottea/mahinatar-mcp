@@ -12,6 +12,7 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Lead } from "./leads.js";
+import { VALID_OUTREACH_STATUS } from "./leads.js";
 import { config } from "./config.js";
 
 /**
@@ -153,6 +154,9 @@ export async function bulkUpdateLeads(
 ): Promise<BulkUpdateResult> {
   const uniqueIds = Array.from(new Set(ids)).filter(Boolean);
   if (uniqueIds.length === 0) return { requested: 0, updated: 0, applied: [] };
+  if (patch.stage && !VALID_OUTREACH_STATUS.has(patch.stage)) {
+    throw new Error(`Invalid stage '${patch.stage}'. outreach_status must be one of: ${[...VALID_OUTREACH_STATUS].join(", ")}.`);
+  }
 
   const update: Record<string, unknown> = {};
   const applied: string[] = [];

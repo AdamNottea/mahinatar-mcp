@@ -197,11 +197,21 @@ function appendNote(existing: string | null | undefined, note: string): string {
  * status and/or stage (outreach_status) and/or append a timestamped note.
  * Returns which fields were applied.
  */
+/**
+ * Valid values for leads.outreach_status (DB CHECK constraint
+ * leads_outreach_status_check). Writing anything else throws a cryptic Postgres
+ * constraint error, so the tools validate `stage` against this set first.
+ */
+export const VALID_OUTREACH_STATUS = new Set(["not_sent", "drafted", "sent", "replied", "bounced"]);
+
 export async function updateLead(
   supabase: SupabaseClient,
   id: string,
   opts: { status?: string; stage?: string; note?: string }
 ): Promise<{ applied: string[] }> {
+  if (opts.stage && !VALID_OUTREACH_STATUS.has(opts.stage)) {
+    throw new Error(`Invalid stage '${opts.stage}'. outreach_status must be one of: ${[...VALID_OUTREACH_STATUS].join(", ")}.`);
+  }
   const cols = await existingColumns(supabase, "leads", [
     "status",
     "outreach_status",
