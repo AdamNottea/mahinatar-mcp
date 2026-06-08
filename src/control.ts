@@ -410,3 +410,99 @@ export async function startScan(
     ...(opts.batchMode != null ? { batchMode: opts.batchMode } : {}),
   });
 }
+
+// ── Site editing (read/write the user's own generated sites) ────────────────
+
+/** Read a generated site's current HTML + data so the agent can decide edits. */
+export async function getSiteHtml(
+  supabase: SupabaseClient,
+  id: string
+): Promise<Record<string, unknown> | null> {
+  const { data, error } = await supabase
+    .from("generated_sites")
+    .select("id, business_name, site_html, site_data, preview_slug, published_at, updated_at")
+    .eq("id", id)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return (data as Record<string, unknown> | null) ?? null;
+}
+
+/**
+ * Overwrite a generated site's home-page HTML (RLS-scoped to the owner). Lets the
+ * agent directly fix/complete a site after inspecting it with getSiteHtml. Keep
+ * accessibility intact (skip-link, focus styles, alt text, landmarks) when editing.
+ * Re-publish with publishSite to push the change to the live URL.
+ */
+export async function updateSiteHtml(
+  supabase: SupabaseClient,
+  id: string,
+  html: string
+): Promise<Record<string, unknown>> {
+  const trimmed = (html ?? "").trim();
+  if (trimmed.length < 50) throw new Error("Refusing to write near-empty HTML (min 50 chars).");
+  if (new TextEncoder().encode(trimmed).length > 2_000_000) throw new Error("HTML exceeds 2MB limit.");
+  const { data, error } = await supabase
+    .from("generated_sites")
+    .update({ site_html: trimmed, updated_at: new Date().toISOString() } as never)
+    .eq("id", id)
+    .select("id, preview_slug")
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!data) throw new Error(`Site ${id} not found or not owned by you.`);
+  return { updated: true, site_id: id, note: "Call mahinatar_publish_site to push this to the live URL." };
+}
+
+/** AI-regenerate one page of a site with an optional instruction (persists). */
+export async function regeneratePage(
+  supabaseUrl: string,
+  accessToken: string,
+  opts: { siteId: string; page?: string; instruction?: string }
+): Promise<Record<string, unknown>> {
+  return callEdge(supabaseUrl, accessToken, "regenerate-page", {
+    siteId: opts.siteId,
+    ...(opts.page ? { page: opts.page } : {}),
+    ...(opts.instruction ? { instruction: opts.instruction } : {}),
+  });
+}
+
+/** Toggle a site add-on (e.g. chatbot, custom domain) on/off. */
+export async function toggleSiteAddon(
+  supabaseUrl: string,
+  accessToken: string,
+  siteId: string,
+  action: string
+): Promise<Record<string, unknown>> {
+  return callEdge(supabaseUrl, accessToken, "toggle-site-addon", { siteId, action });
+}
+
+// ── Audit / prospecting / SEO ───────────────────────────────────────────────
+
+/** Analyze a website (conversion/quality audit) by lead or URL. */
+export async function analyzeWebsite(
+  supabaseUrl: string,
+  accessToken: string,
+  opts: { leadId?: string; websiteUrl?: string }
+): Promise<Record<string, unknown>> {
+  return callEdge(supabaseUrl, accessToken, "analyze-website", {
+    ...(opts.leadId ? { leadId: opts.leadId } : {}),
+    ...(opts.websiteUrl ? { websiteUrl: opts.websiteUrl } : {}),
+  });
+}
+
+/** Scan a lead's full online presence (site, social, maps, reviews). */
+export async function scanPresence(
+  supabaseUrl: string,
+  accessToken: string,
+  leadId: string
+): Promise<Record<string, unknown>> {
+  return callEdge(supabaseUrl, accessToken, "scan-business-presence", { lead_id: leadId });
+}
+
+/** Generate SEO metadata/content for a generated site. */
+export async function generateSeo(
+  supabaseUrl: string,
+  accessToken: string,
+  siteId: string
+): Promise<Record<string, unknown>> {
+  return callEdge(supabaseUrl, accessToken, "generate-seo", { siteId });
+}

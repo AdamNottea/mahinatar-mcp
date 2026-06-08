@@ -25,6 +25,8 @@ import { verifyEmails, verifyEmailDeliverable } from "../verify.js";
 import {
   createLead, importLeads, bulkUpdateLeads, findDuplicateLeads,
   fetchSiteDetail, creditStatus, generateSite, publishSite, deleteSite, startScan,
+  getSiteHtml, updateSiteHtml, regeneratePage, toggleSiteAddon,
+  analyzeWebsite, scanPresence, generateSeo,
 } from "../control.js";
 import {
   createCampaign, listCampaigns, campaignDetail, editCampaign,
@@ -658,6 +660,119 @@ export function registerTools(server: McpServer): void {
         await requireElite();
         const accessToken = await getAccessToken();
         return ok(await deleteSite(config.supabaseUrl, accessToken, site_id));
+      })
+  );
+
+  // ── 24a. get_site_html — read a site's current HTML so the agent can edit it ──
+  server.registerTool(
+    "mahinatar_get_site_html",
+    {
+      title: "Mahinatar: get site HTML",
+      description: "Read a generated site's current home-page HTML + data so you can inspect and decide edits. Pair with mahinatar_update_site_html to fix/complete a site.",
+      inputSchema: { site_id: z.string() },
+    },
+    async ({ site_id }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        const site = await getSiteHtml(supabase, site_id);
+        if (!site) return err(`No site found with id ${site_id}.`);
+        return ok(site);
+      })
+  );
+
+  // ── 24b. update_site_html — overwrite the home-page HTML (direct, RLS) ────────
+  server.registerTool(
+    "mahinatar_update_site_html",
+    {
+      title: "Mahinatar: update site HTML",
+      description: "Overwrite a generated site's home-page HTML to fix or complete it. You edit the HTML yourself (read it first with mahinatar_get_site_html). Keep accessibility intact (skip-link, focus styles, image alt text, landmark regions). Re-publish with mahinatar_publish_site to push it live. Does NOT depend on the in-app editor.",
+      inputSchema: { site_id: z.string(), html: z.string().describe("Full replacement home-page HTML.") },
+    },
+    async ({ site_id, html }) =>
+      guarded(async () => {
+        const { supabase } = await requireElite();
+        return ok(await updateSiteHtml(supabase, site_id, html));
+      })
+  );
+
+  // ── 24c. regenerate_page — AI-regenerate a page with an instruction ──────────
+  server.registerTool(
+    "mahinatar_regenerate_page",
+    {
+      title: "Mahinatar: regenerate page",
+      description: "AI-regenerate one page of a site (persists). Pass an optional `instruction` to steer it (e.g. 'add a tap-to-call button in the hero'). page defaults to 'home'.",
+      inputSchema: { site_id: z.string(), page: z.string().optional(), instruction: z.string().optional() },
+    },
+    async ({ site_id, page, instruction }) =>
+      guarded(async () => {
+        await requireElite();
+        const accessToken = await getAccessToken();
+        return ok(await regeneratePage(config.supabaseUrl, accessToken, { siteId: site_id, page, instruction }));
+      })
+  );
+
+  // ── 24d. toggle_site_addon ───────────────────────────────────────────────────
+  server.registerTool(
+    "mahinatar_toggle_site_addon",
+    {
+      title: "Mahinatar: toggle site add-on",
+      description: "Enable or disable a site add-on (e.g. chatbot, analytics, custom domain). `action` is the add-on action string the app expects.",
+      inputSchema: { site_id: z.string(), action: z.string() },
+    },
+    async ({ site_id, action }) =>
+      guarded(async () => {
+        await requireElite();
+        const accessToken = await getAccessToken();
+        return ok(await toggleSiteAddon(config.supabaseUrl, accessToken, site_id, action));
+      })
+  );
+
+  // ── 24e. analyze_website — conversion/quality audit ──────────────────────────
+  server.registerTool(
+    "mahinatar_analyze_website",
+    {
+      title: "Mahinatar: analyze website",
+      description: "Run a conversion/quality audit of a website. Pass a lead_id (audits the lead's site) or an explicit website_url.",
+      inputSchema: { lead_id: z.string().optional(), website_url: z.string().optional() },
+    },
+    async ({ lead_id, website_url }) =>
+      guarded(async () => {
+        if (!lead_id && !website_url) return err("Provide lead_id or website_url.");
+        await requireElite();
+        const accessToken = await getAccessToken();
+        return ok(await analyzeWebsite(config.supabaseUrl, accessToken, { leadId: lead_id, websiteUrl: website_url }));
+      })
+  );
+
+  // ── 24f. scan_presence — full online-presence scan for a lead ────────────────
+  server.registerTool(
+    "mahinatar_scan_presence",
+    {
+      title: "Mahinatar: scan business presence",
+      description: "Scan a lead's full online presence (website, social, maps, reviews) to enrich targeting and outreach. Costs scan credits.",
+      inputSchema: { lead_id: z.string() },
+    },
+    async ({ lead_id }) =>
+      guarded(async () => {
+        await requireElite();
+        const accessToken = await getAccessToken();
+        return ok(await scanPresence(config.supabaseUrl, accessToken, lead_id));
+      })
+  );
+
+  // ── 24g. generate_seo — SEO metadata/content for a site ──────────────────────
+  server.registerTool(
+    "mahinatar_generate_seo",
+    {
+      title: "Mahinatar: generate SEO",
+      description: "Generate SEO metadata/content (title, meta description, schema) for a generated site.",
+      inputSchema: { site_id: z.string() },
+    },
+    async ({ site_id }) =>
+      guarded(async () => {
+        await requireElite();
+        const accessToken = await getAccessToken();
+        return ok(await generateSeo(config.supabaseUrl, accessToken, site_id));
       })
   );
 
