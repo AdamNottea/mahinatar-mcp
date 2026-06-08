@@ -33,9 +33,29 @@ export interface Draft {
 const OPT_OUT =
   "If you'd rather not hear from me, just reply STOP and I won't reach out again.";
 
-function firstName(name: string | null): string | null {
+// Words that are never a person's first name (scrapes often set owner_name to
+// the business name, e.g. "The Miller Firm" → "Hi The,"). Reject these so we
+// fall back to "Hi there," instead of greeting a fragment.
+const NON_NAME_TOKENS = new Set([
+  "the", "a", "an", "dr", "dr.", "mr", "mr.", "mrs", "mrs.", "ms", "ms.",
+]);
+const BUSINESS_SUFFIX = /\b(llc|llp|inc|co|corp|pllc|pa|pc|ltd|group|firm|clinic|spa|associates|services)\b/i;
+
+/**
+ * Extract a usable first name from owner_name. Returns null when owner_name is
+ * really the business name (equals business_name, contains a company suffix, or
+ * starts with an article/title), so the greeting degrades to "Hi there,".
+ */
+function firstName(name: string | null, businessName?: string | null): string | null {
   if (!name) return null;
-  return name.trim().split(/\s+/)[0] || null;
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+  if (businessName && trimmed.toLowerCase() === businessName.trim().toLowerCase()) return null;
+  if (BUSINESS_SUFFIX.test(trimmed)) return null;
+  const first = trimmed.split(/\s+/)[0];
+  if (!first) return null;
+  if (NON_NAME_TOKENS.has(first.toLowerCase())) return null;
+  return first;
 }
 
 function hasUsableWebsite(lead: Lead): boolean {
@@ -51,7 +71,7 @@ function hasUsableWebsite(lead: Lead): boolean {
 
 export function buildDraft(lead: Lead, tone: Tone, angle?: string): Draft {
   const biz = lead.business_name?.trim() || "your business";
-  const owner = firstName(lead.owner_name);
+  const owner = firstName(lead.owner_name, lead.business_name);
   const greeting = owner ? `Hi ${owner},` : "Hi there,";
   const hasSite = hasUsableWebsite(lead);
   const cityBit = lead.city ? ` in ${lead.city}` : "";

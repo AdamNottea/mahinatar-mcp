@@ -204,6 +204,12 @@ async function doTokenSignIn(): Promise<Session> {
   }
 
   if (error || !data.user) {
+    // Token family is dead (e.g. browser rotated the shared refresh token).
+    // If password creds exist, self-heal by minting a fresh independent
+    // session instead of forcing a manual reconnect.
+    if (config.email && config.password) {
+      return doPasswordSignIn();
+    }
     throw new AuthError(
       `Could not authenticate with the Mahinatar token: ${error?.message ?? "invalid or expired token"}. The refresh token may have been revoked — reconnect from the Mahinatar MCP page.`
     );
@@ -235,14 +241,30 @@ async function doPasswordSignIn(): Promise<Session> {
     );
   }
 
+  // Password sign-in mints a fresh, INDEPENDENT session whose refresh-token
+  // family is owned solely by this server (the browser never sees it), so the
+  // "Already Used" rotation collision that kills token auth cannot happen.
+  // Persist the pair so the normal refresh machinery (ensureFreshToken) keeps
+  // it alive across a long-running process and future boots start valid.
+  if (data.session) {
+    tokens = {
+      accessToken: data.session.access_token,
+      refreshToken: data.session.refresh_token,
+    };
+    saveTokens(tokens);
+    client = null; // rebuild getClient() with the bearer from this session
+  }
+
   const userId = data.user.id;
   const email = data.user.email ?? config.email;
-  const { planId, planStatus } = await resolvePlan(supabase, userId);
+  const { planId, planStatus } = await resolvePlan(getClient(), userId);
   return finalize(userId, email, planId, planStatus, "password");
 }
 
 async function doSignIn(): Promise<Session> {
-  // Prefer token auth when present (Google-login users have no password).
+  // Prefer token auth when present (it carries an existing session). On a hard
+  // token failure doTokenSignIn falls back to password if creds are set, so a
+  // revoked token family self-heals instead of forcing a manual reconnect.
   if (tokens.accessToken) return doTokenSignIn();
   return doPasswordSignIn();
 }

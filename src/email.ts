@@ -10,14 +10,32 @@
 
 import { config } from "./config.js";
 
+/**
+ * Two send transports:
+ *   1. EDGE (default, zero-config): POST to the `send-transactional-email` edge
+ *      function as the authenticated user. The Resend key + from-address live
+ *      SERVER-SIDE, so the MCP never needs a local key — this is what lets the
+ *      connector send autonomously right after install with no extra secrets.
+ *   2. DIRECT: only when a local RESEND_API_KEY + from-address are explicitly
+ *      set (dev/testing). Bypasses the edge function.
+ * The master safety switch MAHINATAR_OUTREACH_LIVE="true" still gates both.
+ */
+function edgeSendAvailable(): boolean {
+  return Boolean(config.supabaseUrl && config.supabaseAnonKey);
+}
+
 export function canSendLive(): { ok: boolean; reason: string | null } {
   if (!config.outreachLive)
     return { ok: false, reason: 'MAHINATAR_OUTREACH_LIVE is not "true" (dry-run mode).' };
-  if (!config.resendApiKey)
-    return { ok: false, reason: "RESEND_API_KEY is not set." };
-  if (!config.fromEmail)
-    return { ok: false, reason: "MAHINATAR_FROM_EMAIL is not set." };
-  return { ok: true, reason: null };
+  // Edge transport needs no local key/from — the server holds them.
+  if (edgeSendAvailable()) return { ok: true, reason: null };
+  // Direct Resend fallback requires both local creds.
+  if (config.resendApiKey && config.fromEmail) return { ok: true, reason: null };
+  return {
+    ok: false,
+    reason:
+      "No send transport: set MAHINATAR_SUPABASE_URL + MAHINATAR_SUPABASE_ANON_KEY (edge send) or RESEND_API_KEY + MAHINATAR_FROM_EMAIL (direct).",
+  };
 }
 
 // Basic deliverability guard: reject obviously-malformed addresses before they
@@ -103,4 +121,69 @@ export async function sendViaResend(args: {
 
   const json = (await res.json()) as { id?: string };
   return { id: json.id ?? "unknown" };
+}
+
+/** Escapes HTML and turns a plain-text body into a simple, personal-looking
+ * email (clickable links, line breaks). Cold outreach converts better as plain
+ * text than as a branded template, so we deliberately keep it minimal. */
+function plainBodyToHtml(text: string): string {
+  const esc = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  const linked = esc.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1">$1</a>');
+  return linked.replace(/\r?\n/g, "<br>\n");
+}
+
+/**
+ * Send via the server-side `send-transactional-email` edge function as the
+ * authenticated user. The Resend key + from-address live in Supabase secrets,
+ * so no local key is required. Reply-To routes prospect replies to a real inbox.
+ */
+export async function sendViaEdge(args: {
+  to: string;
+  subject: string;
+  body: string;
+}): Promise<SendResult> {
+  const { getAccessToken } = await import("./supabase.js");
+  const token = await getAccessToken();
+  const url = `${config.supabaseUrl.replace(/\/$/, "")}/functions/v1/send-transactional-email`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      apikey: config.supabaseAnonKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      to: args.to,
+      subject: args.subject,
+      html: plainBodyToHtml(withComplianceFooter(args.body)),
+      ...(config.replyTo ? { replyTo: config.replyTo } : {}),
+    }),
+  });
+
+  const json = (await res.json().catch(() => ({}))) as { sent?: boolean; id?: string; error?: string };
+  if (!res.ok || json.error) {
+    throw new Error(`send-transactional-email ${res.status}: ${json.error ?? "send failed"}`);
+  }
+  return { id: json.id ?? "unknown" };
+}
+
+/**
+ * Transport-agnostic send. Prefers the direct Resend path ONLY when a local key
+ * + from-address are explicitly configured (dev/testing); otherwise routes
+ * through the server-side edge function (the default for installed connectors).
+ * Always honors canSendLive() — throws if a real send is not permitted.
+ */
+export async function send(args: {
+  to: string;
+  subject: string;
+  body: string;
+}): Promise<SendResult> {
+  const guard = canSendLive();
+  if (!guard.ok) throw new Error(`Refusing to send: ${guard.reason}`);
+  if (config.resendApiKey && config.fromEmail) return sendViaResend(args);
+  return sendViaEdge(args);
 }

@@ -8,7 +8,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { getSession, getAuthedClient, requireElite, getAccessToken, AuthError } from "../supabase.js";
-import { canSendLive, sendViaResend, isSendableEmail } from "../email.js";
+import { canSendLive, send, isSendableEmail } from "../email.js";
 import { config, MAX_SENDS_PER_RUN } from "../config.js";
 import {
   listLeads,
@@ -209,7 +209,7 @@ export function registerTools(server: McpServer): void {
           );
         }
 
-        const result = await sendViaResend({ to: recipient, subject, body });
+        const result = await send({ to: recipient, subject, body });
         sendsThisRun += 1;
 
         // Record the send in outreach_log so it shows up in the app's Cold
@@ -472,7 +472,7 @@ export function registerTools(server: McpServer): void {
           const mx = await verifyEmailDeliverable(recipient);
           if (!mx.deliverable) { results.push({ id: lead.id, business_name: lead.business_name, sent: false, skipped: true, reason: `undeliverable: ${mx.reason}` }); continue; }
           try {
-            const r = await sendViaResend({ to: recipient, subject: draft.subject, body: draft.body });
+            const r = await send({ to: recipient, subject: draft.subject, body: draft.body });
             sendsThisRun += 1;
             try { await supabase.from("outreach_log").insert({ user_id: session.userId, lead_id: lead.id, channel: "mcp", status: "sent", recipient, subject: draft.subject, body: draft.body, template_used: "mcp" } as never); } catch { /* logging must never break a send */ }
             let marked = true; try { await markLeadContacted(supabase, lead.id); } catch { marked = false; }
