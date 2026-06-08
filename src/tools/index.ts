@@ -8,6 +8,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { getSession, getAuthedClient, requireElite, getAccessToken, AuthError } from "../supabase.js";
+import { getDisabledTools, ALWAYS_ALLOWED } from "../permissions.js";
 import { canSendLive, send, isSendableEmail } from "../email.js";
 import { config, MAX_SENDS_PER_RUN } from "../config.js";
 import {
@@ -56,8 +57,35 @@ async function guarded(fn: () => Promise<ToolResult>): Promise<ToolResult> {
 }
 
 export function registerTools(server: McpServer): void {
+  // Real-time permission gate: every tool (except whoami) checks the owner's
+  // disabled-tool list before running, so toggles in the in-app control panel
+  // take effect within a few seconds. Fails open on a permission-read error.
+  const gatedTool = (
+    srv: McpServer,
+    name: string,
+    def: unknown,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- generic wrapper boundary over heterogeneous per-tool handler signatures
+    handler: (...a: any[]) => Promise<ToolResult>
+  ): void => {
+    srv.registerTool(name, def as never, (async (...a: any[]) => {
+      if (!ALWAYS_ALLOWED.has(name)) {
+        try {
+          const { supabase, session } = await getAuthedClient();
+          const disabled = await getDisabledTools(supabase, session.userId);
+          if (disabled.has(name)) {
+            return err(`Tool '${name}' is disabled by the account owner in the Mahinatar control panel (mahinatar.me/mcp). Enable it there to use it.`);
+          }
+        } catch (e) {
+          if (e instanceof AuthError) return err(e.message);
+          // fail open on permission-read errors — the tool's own Elite/RLS gates still apply
+        }
+      }
+      return handler(...a);
+    }) as never);
+  };
+
   // 1. whoami — no gate.
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_whoami",
     {
       title: "Mahinatar: who am I",
@@ -84,7 +112,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // 2. list_leads — Elite-gated.
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_list_leads",
     {
       title: "Mahinatar: list leads",
@@ -109,7 +137,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // 3. lead_detail — Elite-gated.
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_lead_detail",
     {
       title: "Mahinatar: lead detail",
@@ -126,7 +154,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // 4. draft_outreach — Elite-gated. No LLM; returns brief + sendable draft.
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_draft_outreach",
     {
       title: "Mahinatar: draft outreach",
@@ -158,7 +186,7 @@ export function registerTools(server: McpServer): void {
   //   - SUPPRESSION: skip leads flagged do_not_contact / unsubscribed (defensive).
   //   - REQUIRES owner_email (or an explicit `to`).
   //   On success we best-effort mark the lead contacted.
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_send_outreach",
     {
       title: "Mahinatar: send outreach",
@@ -236,7 +264,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // 6. mark_contacted — Elite-gated.
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_mark_contacted",
     {
       title: "Mahinatar: mark contacted",
@@ -263,7 +291,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // 7. pipeline_summary — Elite-gated. Situational awareness.
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_pipeline_summary",
     {
       title: "Mahinatar: pipeline summary",
@@ -279,7 +307,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // 8. search_leads — Elite-gated. Targeted search.
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_search_leads",
     {
       title: "Mahinatar: search leads",
@@ -310,7 +338,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // 9. next_actions — Elite-gated. "What should I do to make money right now."
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_next_actions",
     {
       title: "Mahinatar: next actions",
@@ -329,7 +357,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // 10. update_lead — Elite-gated. Generalized update (supersedes mark_contacted).
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_update_lead",
     {
       title: "Mahinatar: update lead",
@@ -356,7 +384,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // 11. bulk_draft_outreach — Elite-gated. Drafts only, never sends. Cap 25.
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_bulk_draft_outreach",
     {
       title: "Mahinatar: bulk draft outreach",
@@ -382,7 +410,7 @@ export function registerTools(server: McpServer): void {
 
         let leads;
         if (ids && ids.length > 0) {
-          const picked = await Promise.all(ids.slice(0, 25).map((id) => fetchLead(supabase, id)));
+          const picked = await Promise.all(ids.slice(0, 25).map((id: string) => fetchLead(supabase, id)));
           leads = picked.filter((l): l is NonNullable<typeof l> => l != null);
         } else {
           leads = await listLeads(supabase, {
@@ -401,7 +429,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // 12. due_followups — Elite-gated.
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_due_followups",
     {
       title: "Mahinatar: due follow-ups",
@@ -420,7 +448,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // 13. list_sites — Elite-gated. The user's generated websites.
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_list_sites",
     {
       title: "Mahinatar: list generated sites",
@@ -440,7 +468,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 14. bulk_send_outreach — parity with the remote server ──────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_bulk_send_outreach",
     {
       title: "Mahinatar: bulk send outreach",
@@ -486,7 +514,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 15. enrich_leads — parity with the remote server ────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_enrich_leads",
     {
       title: "Mahinatar: enrich leads (find emails)",
@@ -513,7 +541,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 16. verify_emails — real MX/SMTP deliverability check ────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_verify_emails",
     {
       title: "Mahinatar: verify emails (MX)",
@@ -526,7 +554,7 @@ export function registerTools(server: McpServer): void {
         const { supabase } = await requireElite();
         let list: string[] = emails ?? [];
         if ((!emails || emails.length === 0) && ids && ids.length > 0) {
-          const leads = await Promise.all(ids.slice(0, 100).map((id) => fetchLead(supabase, id)));
+          const leads = await Promise.all(ids.slice(0, 100).map((id: string) => fetchLead(supabase, id)));
           list = leads.map((l) => l?.owner_email).filter((e): e is string => Boolean(e));
         }
         if (list.length === 0) return err("Provide `emails` (array) or `ids` (leads with owner_email) to verify.");
@@ -536,7 +564,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 17. create_lead ─────────────────────────────────────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_create_lead",
     {
       title: "Mahinatar: create lead",
@@ -552,7 +580,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 18. import_leads (bulk) ──────────────────────────────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_import_leads",
     {
       title: "Mahinatar: import leads (bulk)",
@@ -567,7 +595,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 19. bulk_update_leads ────────────────────────────────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_bulk_update_leads",
     {
       title: "Mahinatar: bulk update leads",
@@ -583,7 +611,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 20. find_duplicate_leads ─────────────────────────────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_find_duplicate_leads",
     {
       title: "Mahinatar: find duplicate leads",
@@ -599,7 +627,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 21. site_detail ──────────────────────────────────────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_site_detail",
     {
       title: "Mahinatar: site detail",
@@ -615,7 +643,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 22. generate_site ────────────────────────────────────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_generate_site",
     {
       title: "Mahinatar: generate site",
@@ -632,7 +660,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 23. publish_site ─────────────────────────────────────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_publish_site",
     {
       title: "Mahinatar: publish site",
@@ -648,7 +676,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 24. delete_site ──────────────────────────────────────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_delete_site",
     {
       title: "Mahinatar: delete site",
@@ -664,7 +692,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 24a. get_site_html — read a site's current HTML so the agent can edit it ──
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_get_site_html",
     {
       title: "Mahinatar: get site HTML",
@@ -681,7 +709,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 24b. update_site_html — overwrite the home-page HTML (direct, RLS) ────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_update_site_html",
     {
       title: "Mahinatar: update site HTML",
@@ -696,7 +724,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 24c. regenerate_page — AI-regenerate a page with an instruction ──────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_regenerate_page",
     {
       title: "Mahinatar: regenerate page",
@@ -712,7 +740,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 24d. toggle_site_addon ───────────────────────────────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_toggle_site_addon",
     {
       title: "Mahinatar: toggle site add-on",
@@ -728,7 +756,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 24e. analyze_website — conversion/quality audit ──────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_analyze_website",
     {
       title: "Mahinatar: analyze website",
@@ -745,7 +773,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 24f. scan_presence — full online-presence scan for a lead ────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_scan_presence",
     {
       title: "Mahinatar: scan business presence",
@@ -761,7 +789,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 24g. generate_seo — SEO metadata/content for a site ──────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_generate_seo",
     {
       title: "Mahinatar: generate SEO",
@@ -777,7 +805,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 25. start_scan ───────────────────────────────────────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_start_scan",
     {
       title: "Mahinatar: start scan",
@@ -793,7 +821,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ── 26. credit_status ────────────────────────────────────────────────────────
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_credit_status",
     {
       title: "Mahinatar: credit status",
@@ -819,7 +847,7 @@ export function registerTools(server: McpServer): void {
     from_email: z.string().optional(),
   };
 
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_create_campaign",
     {
       title: "Mahinatar: create campaign",
@@ -834,7 +862,7 @@ export function registerTools(server: McpServer): void {
       })
   );
 
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_list_campaigns",
     {
       title: "Mahinatar: list campaigns",
@@ -849,7 +877,7 @@ export function registerTools(server: McpServer): void {
       })
   );
 
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_campaign_detail",
     {
       title: "Mahinatar: campaign detail",
@@ -865,7 +893,7 @@ export function registerTools(server: McpServer): void {
       })
   );
 
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_edit_campaign",
     {
       title: "Mahinatar: edit campaign",
@@ -880,7 +908,7 @@ export function registerTools(server: McpServer): void {
       })
   );
 
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_enroll_leads",
     {
       title: "Mahinatar: enroll leads in campaign",
@@ -904,7 +932,7 @@ export function registerTools(server: McpServer): void {
       })
   );
 
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_pause_campaign",
     {
       title: "Mahinatar: pause campaign",
@@ -918,7 +946,7 @@ export function registerTools(server: McpServer): void {
       })
   );
 
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_resume_campaign",
     {
       title: "Mahinatar: resume campaign",
@@ -932,7 +960,7 @@ export function registerTools(server: McpServer): void {
       })
   );
 
-  server.registerTool(
+  gatedTool(server, 
     "mahinatar_campaign_status",
     {
       title: "Mahinatar: campaign status",
