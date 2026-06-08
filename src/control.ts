@@ -12,6 +12,31 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Lead } from "./leads.js";
+import { config } from "./config.js";
+
+/**
+ * Look up the freshest generated site for a lead via PostgREST. generate-website
+ * persists its homepage checkpoint at ~82% progress, so when the SSE stream ends
+ * before the terminal site_id arrives (generation can run ~5 min), this recovers
+ * the real site_id instead of returning null.
+ */
+async function newestSiteIdForLead(
+  supabaseUrl: string,
+  accessToken: string,
+  leadId: string
+): Promise<string | null> {
+  try {
+    const url = `${supabaseUrl.replace(/\/$/, "")}/rest/v1/generated_sites?select=id&lead_id=eq.${leadId}&order=created_at.desc&limit=1`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}`, apikey: config.supabaseAnonKey },
+    });
+    if (!res.ok) return null;
+    const rows = (await res.json().catch(() => [])) as { id?: string }[];
+    return Array.isArray(rows) && rows[0]?.id ? rows[0].id : null;
+  } catch {
+    return null;
+  }
+}
 
 // ── Lead CRUD / import / bulk / dedupe ──────────────────────────────────────
 
@@ -260,10 +285,15 @@ export async function callEdge(
 }
 
 /**
- * Trigger site generation. mode 'lead' regenerates against an existing lead;
- * 'scratch' builds from a business name with no source URL. The generate-website
- * function streams SSE for the app UI but also accepts a plain POST; we return
- * whatever JSON envelope it emits.
+ * Trigger site generation and return the persisted site_id.
+ *
+ * generate-website responds with a Server-Sent Events stream (the app UI reads
+ * progress from it). The site_id only appears mid/late-stream — in the terminal
+ * `complete`/`done` event, and in an early homepage `checkpoint`. The previous
+ * implementation called `res.json()` on that stream, which can't parse SSE, so
+ * it returned `{}` with no site ("flaky generation"). We now consume the stream
+ * and surface the real site_id. mode 'lead' regenerates against an existing
+ * lead; 'scratch' builds from a business name with no source URL.
  */
 export async function generateSite(
   supabaseUrl: string,
@@ -275,7 +305,89 @@ export async function generateSite(
   if (opts.lead_id) body.lead_id = opts.lead_id;
   if (opts.business_name) body.business_name = opts.business_name;
   if (opts.source_url) body.source_url = opts.source_url;
-  return callEdge(supabaseUrl, accessToken, "generate-website", body);
+
+  const res = await fetch(`${supabaseUrl.replace(/\/$/, "")}/functions/v1/generate-website`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const raw = await res.text().catch(() => "");
+    let msg = raw;
+    try { const j = JSON.parse(raw); msg = (j.message as string) ?? (j.error as string) ?? raw; } catch { /* keep raw */ }
+    throw new Error(`generate-website failed (${res.status}): ${msg || "see app logs"}`);
+  }
+
+  const ct = res.headers.get("content-type") ?? "";
+  if (!ct.includes("event-stream") || !res.body) {
+    // Non-stream response (e.g. an early JSON error envelope) — pass it through.
+    return (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  }
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let siteId: string | null = null;
+  let status: string | null = null;
+  let lastError: string | null = null;
+  const recentEvents: string[] = [];
+  const deadlineMs = Date.now() + 180_000; // cap the blocking window; DB fallback covers the slow tail
+
+  try {
+    while (Date.now() < deadlineMs) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const blocks = buf.split("\n\n");
+      buf = blocks.pop() ?? "";
+      for (const block of blocks) {
+        const dataLine = block.split("\n").find((l) => l.startsWith("data:"));
+        if (!dataLine) continue;
+        const payload = dataLine.slice(5).trim();
+        if (!payload) continue;
+        let ev: Record<string, unknown>;
+        try { ev = JSON.parse(payload) as Record<string, unknown>; } catch { continue; }
+        const evType = (ev.type as string) ?? (ev.status as string);
+        if (typeof evType === "string") recentEvents.push(evType);
+        const sid = (ev.site_id as string) ?? (ev.siteId as string) ?? (ev.checkpointSiteId as string);
+        if (typeof sid === "string" && sid) siteId = sid;
+        if (ev.type === "complete" || ev.type === "done" || ev.status === "complete") status = "complete";
+        if (ev.type === "error" || ev.status === "failed" || ev.error) {
+          lastError = (ev.message as string) ?? (ev.error as string) ?? "generation error";
+          status = status ?? "failed";
+        }
+      }
+    }
+  } finally {
+    try { await reader.cancel(); } catch { /* already closed */ }
+  }
+
+  // Stream didn't surface a site_id in time — but generation continues
+  // server-side and persists a checkpoint row. Recover it from the DB.
+  if (!siteId && opts.lead_id) {
+    siteId = await newestSiteIdForLead(supabaseUrl, accessToken, opts.lead_id);
+    if (siteId) status = status ?? "persisted";
+  }
+
+  if (siteId) {
+    return { site_id: siteId, status: status ?? "done", events: recentEvents.slice(-8) };
+  }
+  if (status === "failed") {
+    return { site_id: null, status: "failed", error: lastError, events: recentEvents.slice(-12) };
+  }
+  // Still generating (the ~82% checkpoint hasn't landed yet). Honest, not a null
+  // error: the site will appear shortly — fetch it with mahinatar_list_sites.
+  return {
+    site_id: null,
+    status: "running",
+    note: "Generation is still running (~5 min total). The site persists server-side — call mahinatar_list_sites in a minute to get its id/url.",
+    events: recentEvents.slice(-12),
+  };
 }
 
 export async function publishSite(supabaseUrl: string, accessToken: string, siteId: string): Promise<Record<string, unknown>> {
