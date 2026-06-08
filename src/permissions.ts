@@ -13,7 +13,9 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 const CACHE_TTL_MS = 5000;
-let cache: { tools: Set<string>; at: number } | null = null;
+// Keyed by userId for correctness/parity with the remote server (this stdio
+// server is single-user, but a userId-keyed cache is the right shape regardless).
+let cache: { userId: string; tools: Set<string>; at: number } | null = null;
 
 /** Tools that can never be disabled (the AI must always be able to identify itself). */
 export const ALWAYS_ALLOWED = new Set<string>(["mahinatar_whoami"]);
@@ -24,7 +26,7 @@ export async function getDisabledTools(
   userId: string
 ): Promise<Set<string>> {
   const now = Date.now();
-  if (cache && now - cache.at < CACHE_TTL_MS) return cache.tools;
+  if (cache && cache.userId === userId && now - cache.at < CACHE_TTL_MS) return cache.tools;
   try {
     const { data } = await supabase
       .from("mcp_permissions")
@@ -32,10 +34,10 @@ export async function getDisabledTools(
       .eq("user_id", userId)
       .maybeSingle();
     const arr = (data as { disabled_tools?: string[] } | null)?.disabled_tools ?? [];
-    cache = { tools: new Set(arr), at: now };
+    cache = { userId, tools: new Set(arr), at: now };
   } catch {
     // Fail OPEN on a read error — a transient DB blip must not brick the AI.
-    cache = { tools: new Set(), at: now };
+    cache = { userId, tools: new Set(), at: now };
   }
   return cache.tools;
 }
