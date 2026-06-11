@@ -248,6 +248,7 @@ export function registerTools(server: McpServer): void {
           await supabase.from("outreach_log").insert({
             user_id: session.userId, lead_id: id, channel: "mcp", status: "sent",
             recipient, subject, body, template_used: "mcp",
+            provider_id: result.id,
           } as never);
         } catch { /* never break a send on a logging failure */ }
 
@@ -504,7 +505,7 @@ export function registerTools(server: McpServer): void {
           try {
             const r = await send({ to: recipient, subject: draft.subject, body: draft.body });
             sendsThisRun += 1;
-            try { await supabase.from("outreach_log").insert({ user_id: session.userId, lead_id: lead.id, channel: "mcp", status: "sent", recipient, subject: draft.subject, body: draft.body, template_used: "mcp" } as never); } catch { /* logging must never break a send */ }
+            try { await supabase.from("outreach_log").insert({ user_id: session.userId, lead_id: lead.id, channel: "mcp", status: "sent", recipient, subject: draft.subject, body: draft.body, template_used: "mcp", provider_id: r.id } as never); } catch { /* logging must never break a send */ }
             let marked = true; try { await markLeadContacted(supabase, lead.id); } catch { marked = false; }
             results.push({ id: lead.id, business_name: lead.business_name, sent: true, to: recipient, providerId: r.id, leadMarkedContacted: marked });
           } catch (e) { results.push({ id: lead.id, business_name: lead.business_name, sent: false, error: (e as Error).message }); }
