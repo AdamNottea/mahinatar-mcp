@@ -308,7 +308,7 @@ export interface GeneratedSite {
 function siteUrl(row: Record<string, unknown>): string | null {
   if (row.custom_domain) return `https://${String(row.custom_domain).replace(/^https?:\/\//, "")}`;
   const slug = row.preview_slug || row.site_slug;
-  if (slug) return `https://www.mahinatar.me/s/${slug}`;
+  if (slug) return `https://www.mahinatar.me/preview/${slug}`;
   return null;
 }
 
