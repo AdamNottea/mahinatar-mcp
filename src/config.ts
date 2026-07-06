@@ -55,4 +55,4 @@ export const OWNER_EMAILS = new Set(["adamnottea@gmail.com"]);
 export const MAX_SENDS_PER_RUN = 20;
 
 export const UPGRADE_MESSAGE =
-  "Mahinatar pipeline outreach is an Elite feature. Upgrade at https://mahinatar.com/pricing to unlock lead outreach.";
+  "Mahinatar pipeline outreach is an Elite feature. Upgrade at https://www.mahinatar.me/pricing to unlock lead outreach.";

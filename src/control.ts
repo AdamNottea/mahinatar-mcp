@@ -227,7 +227,7 @@ export async function fetchSiteDetail(
   const slug = row.preview_slug || row.site_slug;
   const url = row.custom_domain
     ? `https://${String(row.custom_domain).replace(/^https?:\/\//, "")}`
-    : slug ? `https://mahinatar.com/s/${slug}` : null;
+    : slug ? `https://www.mahinatar.me/s/${slug}` : null;
   const published = Boolean(row.published_at || row.is_published_on_free);
   return { ...row, computed_url: url, computed_status: published ? "published" : row.is_done ? "done" : "draft" };
 }
